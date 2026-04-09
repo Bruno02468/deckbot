@@ -1,0 +1,10 @@
+venv/
+.env
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[cod]
+.ruff_cache/
+dist/
+*.egg-info/

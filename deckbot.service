@@ -1,0 +1,22 @@
+[Unit]
+Description=DeckBot — MYSTRAN deck-archiving Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deckbot
+Group=deckbot
+WorkingDirectory=/opt/deckbot
+EnvironmentFile=/opt/deckbot/.env
+ExecStart=/opt/deckbot/venv/bin/python -m deckbot run
+Restart=on-failure
+RestartSec=10
+# Give the bot 30 s to shut down cleanly before SIGKILL.
+TimeoutStopSec=30
+# Harden the service slightly.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
