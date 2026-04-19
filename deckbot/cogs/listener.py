@@ -27,8 +27,12 @@ class ListenerCog(commands.Cog, name="Listener"):
     if not message.guild or message.author.bot:
       return
 
-    # Only process messages from channels the bot is tracking.
-    if message.channel.id not in self.bot.tracked_channel_ids:
+    # Accept messages from tracked channels, or threads inside them.
+    ch = message.channel
+    if isinstance(ch, discord.Thread):
+      if ch.parent_id not in self.bot.tracked_channel_ids:
+        return
+    elif ch.id not in self.bot.tracked_channel_ids:
       return
 
     # Skip messages with no attachments early.

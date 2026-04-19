@@ -16,6 +16,83 @@ log = logging.getLogger(__name__)
 _COMMIT_EVERY = 100
 
 
+async def _crawl_thread(
+  thread: discord.Thread,
+  session: AsyncSession,
+) -> int:
+  """Crawl all messages in a single thread, returning the message count."""
+  count = 0
+
+  async for message in thread.history(limit=None, oldest_first=True):
+    try:
+      await process_message(message, session)
+    except Exception:
+      log.exception(
+        "Error processing message %d in thread %d (%s)",
+        message.id,
+        thread.id,
+        thread.name,
+      )
+
+    count += 1
+
+    if count % _COMMIT_EVERY == 0:
+      await session.commit()
+      log.info(
+        "Thread crawl checkpoint: %d messages in thread %d (%s)",
+        count,
+        thread.id,
+        thread.name,
+      )
+
+  await session.commit()
+  log.info(
+    "Thread crawl complete: %d messages in thread %d (%s)",
+    count,
+    thread.id,
+    thread.name,
+  )
+  return count
+
+
+async def _crawl_all_threads(
+  channel: discord.TextChannel,
+  session: AsyncSession,
+) -> int:
+  """Crawl all active and public archived threads of *channel*."""
+  threads: list[discord.Thread] = []
+
+  # Active threads (guild-wide, filtered to this channel).
+  try:
+    active = await channel.guild.fetch_active_threads()
+    threads.extend(t for t in active.threads if t.parent_id == channel.id)
+  except discord.Forbidden:
+    log.warning(
+      "No permission to fetch active threads in channel %d", channel.id
+    )
+
+  # Public archived threads.
+  try:
+    async for thread in channel.archived_threads(limit=None):
+      threads.append(thread)
+  except discord.Forbidden:
+    log.warning(
+      "No permission to fetch archived threads in channel %d", channel.id
+    )
+
+  log.info(
+    "Found %d thread(s) to crawl in channel %d",
+    len(threads),
+    channel.id,
+  )
+
+  total = 0
+  for thread in threads:
+    total += await _crawl_thread(thread, session)
+
+  return total
+
+
 async def crawl_channel(
   channel_id: int,
   bot: commands.Bot,
@@ -88,3 +165,13 @@ async def crawl_channel(
     count,
     channel_id,
   )
+
+  # Also crawl threads belonging to this channel.
+  if isinstance(channel, discord.TextChannel):
+    thread_count = await _crawl_all_threads(channel, session)
+    log.info(
+      "Thread crawl complete: %d total messages across all threads "
+      "in channel %d",
+      thread_count,
+      channel_id,
+    )
