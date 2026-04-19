@@ -1252,7 +1252,7 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
       if op2:
         links.append(f"[OP2]({base}/run/{run.id}/files/{op2.filename})")
       if run_files:
-        links.append(f"[results]({base}/run/{run.id}/zip)")
+        links.append(f"[everything]({base}/run/{run.id}/zip)")
     embed.add_field(
       name="Output files",
       value=" · ".join(links) if links else "—",
