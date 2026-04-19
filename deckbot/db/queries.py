@@ -6,7 +6,17 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from deckbot.db.models import Channel, Deck, DeckTag, Job, Setting
+from deckbot.db.models import (
+  Channel,
+  Deck,
+  DeckTag,
+  Job,
+  MystranVersion,
+  Node,
+  Run,
+  RunFile,
+  Setting,
+)
 from deckbot.models.deck import DeckInfo
 from deckbot.models.sol import SolType
 
@@ -241,3 +251,175 @@ async def remove_tag(
     return False
   await session.delete(existing)
   return True
+
+
+# ── Nodes ─────────────────────────────────────────────────────────────────────
+
+
+async def get_node_by_key_hash(
+  session: AsyncSession, key_hash: str
+) -> Node | None:
+  result = await session.execute(
+    select(Node).where(
+      Node.api_key_hash == key_hash,
+      Node.is_active == True,  # noqa: E712
+    )
+  )
+  return result.scalar_one_or_none()
+
+
+async def get_node_by_name(session: AsyncSession, name: str) -> Node | None:
+  result = await session.execute(select(Node).where(Node.name == name))
+  return result.scalar_one_or_none()
+
+
+async def list_nodes(session: AsyncSession) -> list[Node]:
+  result = await session.execute(select(Node).order_by(Node.created_at.asc()))
+  return list(result.scalars().all())
+
+
+# ── MystranVersions ───────────────────────────────────────────────────────────
+
+
+async def get_or_create_version(
+  session: AsyncSession,
+  repo_name: str,
+  commit_hash: str,
+  ref_name: str | None,
+) -> MystranVersion:
+  """Find an existing (repo_name, commit_hash) pair or create a new one."""
+  result = await session.execute(
+    select(MystranVersion).where(
+      MystranVersion.repo_name == repo_name,
+      MystranVersion.commit_hash == commit_hash,
+    )
+  )
+  version = result.scalar_one_or_none()
+  if version is None:
+    version = MystranVersion(
+      repo_name=repo_name,
+      commit_hash=commit_hash,
+      ref_name=ref_name,
+      resolved_at=datetime.now(UTC),
+    )
+    session.add(version)
+    await session.flush()
+  return version
+
+
+# ── Runs ──────────────────────────────────────────────────────────────────────
+
+
+async def get_run(session: AsyncSession, run_id: int) -> Run | None:
+  result = await session.execute(
+    select(Run)
+    .options(
+      selectinload(Run.deck),
+      selectinload(Run.version),
+      selectinload(Run.node),
+    )
+    .where(Run.id == run_id)
+  )
+  return result.scalar_one_or_none()
+
+
+async def get_active_run_for_deck_version(
+  session: AsyncSession, deck_id: int, version_id: int
+) -> Run | None:
+  """Return an existing pending or running run for (deck, version), if any."""
+  result = await session.execute(
+    select(Run).where(
+      Run.deck_id == deck_id,
+      Run.version_id == version_id,
+      Run.status.in_(["pending", "running"]),
+    )
+  )
+  return result.scalar_one_or_none()
+
+
+async def list_runs_for_deck(
+  session: AsyncSession,
+  deck_id: int,
+  *,
+  page: int = 1,
+  per_page: int = 5,
+) -> tuple[list[Run], int]:
+  """Return (page_of_runs, total_count) for a deck, newest-first."""
+  count_q = select(func.count()).select_from(Run).where(Run.deck_id == deck_id)
+  total: int = (await session.execute(count_q)).scalar_one()
+
+  result = await session.execute(
+    select(Run)
+    .options(selectinload(Run.version), selectinload(Run.node))
+    .where(Run.deck_id == deck_id)
+    .order_by(Run.created_at.desc())
+    .offset((page - 1) * per_page)
+    .limit(per_page)
+  )
+  return list(result.scalars().all()), total
+
+
+async def claim_pending_runs(
+  session: AsyncSession, node_id: int, slots: int
+) -> list[Run]:
+  """Atomically claim up to `slots` pending runs for a node.
+
+  Marks claimed runs as ``running``, sets ``node_id`` and ``started_at``.
+  Returns the list of claimed Run objects (with deck + version loaded).
+  """
+  result = await session.execute(
+    select(Run)
+    .options(selectinload(Run.deck), selectinload(Run.version))
+    .where(Run.status == "pending")
+    .order_by(Run.created_at.asc())
+    .limit(slots)
+    .with_for_update(skip_locked=True)
+  )
+  runs = list(result.scalars().all())
+  now = datetime.now(UTC)
+  for run in runs:
+    run.status = "running"
+    run.node_id = node_id
+    run.started_at = now
+  return runs
+
+
+async def count_pending_runs_for_deck_version(
+  session: AsyncSession,
+  *,
+  name: str | None = None,
+  sol: str | None = None,
+  min_grids: int | None = None,
+  max_grids: int | None = None,
+  tag: str | None = None,
+  channel_id: int | None = None,
+  version_id: int,
+) -> int:
+  """Count how many decks matching the filters already have a pending/running
+  run for the given version. Used for bulk-run pre-flight checks."""
+  subq = select(Deck.id)
+  if name is not None:
+    subq = subq.where(Deck.filename.ilike(f"%{name}%"))
+  if sol is not None:
+    subq = subq.where(Deck.sol == sol)
+  if min_grids is not None:
+    subq = subq.where(Deck.grid_count >= min_grids)
+  if max_grids is not None:
+    subq = subq.where(Deck.grid_count <= max_grids)
+  if tag is not None:
+    subq = subq.where(
+      Deck.id.in_(select(DeckTag.deck_id).where(DeckTag.tag == tag))
+    )
+  if channel_id is not None:
+    subq = subq.where(Deck.source_channel_id == channel_id)
+
+  count_q = (
+    select(func.count())
+    .select_from(Run)
+    .where(
+      Run.version_id == version_id,
+      Run.status.in_(["pending", "running"]),
+      Run.deck_id.in_(subq),
+    )
+  )
+  return (await session.execute(count_q)).scalar_one()
