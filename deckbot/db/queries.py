@@ -373,7 +373,6 @@ async def claim_pending_runs(
     .where(Run.status == "pending")
     .order_by(Run.created_at.asc())
     .limit(slots)
-    .with_for_update(skip_locked=True)
   )
   runs = list(result.scalars().all())
   now = datetime.now(UTC)

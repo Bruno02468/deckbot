@@ -1,0 +1,20 @@
+[Unit]
+Description=DeckBot API — MYSTRAN run node HTTP API
+After=network-online.target deckbot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deckbot
+Group=deckbot
+WorkingDirectory=/opt/deckbot
+EnvironmentFile=/opt/deckbot/.env
+ExecStart=/opt/deckbot/venv/bin/python -m deckbot api --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
