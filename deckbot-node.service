@@ -1,0 +1,21 @@
+[Unit]
+Description=DeckBot Node — MYSTRAN compute node client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deckbot-node
+Group=deckbot-node
+WorkingDirectory=/opt/deckbot-node
+EnvironmentFile=/opt/deckbot-node/.env
+ExecStart=/opt/deckbot-node/venv/bin/python -m deckbot node
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=300
+# Allow the node time to finish in-progress builds on shutdown.
+KillMode=process
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

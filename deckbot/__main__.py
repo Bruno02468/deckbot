@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 
 
 def main() -> None:
@@ -23,6 +24,8 @@ def main() -> None:
     default=8000,
     help="Port to bind (default: 8000)",
   )
+
+  subparsers.add_parser("node", help="Start the compute node client")
 
   args = parser.parse_args()
 
@@ -48,6 +51,20 @@ def main() -> None:
       port=args.port,
       log_level="info",
     )
+  elif args.command == "node":
+    from deckbot.node.client import NodeClient
+    from deckbot.node.config import get_node_settings
+
+    logging.basicConfig(
+      level=logging.INFO,
+      format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    client = NodeClient(get_node_settings())
+    try:
+      asyncio.run(client.run())
+    except KeyboardInterrupt:
+      pass
 
 
 if __name__ == "__main__":

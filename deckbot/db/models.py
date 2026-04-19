@@ -231,5 +231,3 @@ class RunFile(Base):
   )
 
   run: Mapped[Run] = relationship("Run", back_populates="files")
-
-  deck: Mapped[Deck] = relationship("Deck", back_populates="tags")

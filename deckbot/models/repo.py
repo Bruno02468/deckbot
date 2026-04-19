@@ -8,5 +8,5 @@ Add entries here to allow users to reference a repository in ``/deck run``.
 """
 
 APPROVED_REPOS: dict[str, str] = {
-  "mystran": "https://github.com/SteveDoyle2/MYSTRAN.git",
+  "mystran": "https://github.com/MYSTRANsolver/MYSTRAN.git",
 }

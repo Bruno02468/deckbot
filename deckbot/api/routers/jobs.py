@@ -19,6 +19,7 @@ from deckbot.db.queries import (
   get_setting,
 )
 from deckbot.models.repo import APPROVED_REPOS
+from deckbot.models.run import CompleteMetadata, JobItem
 
 router = APIRouter(tags=["jobs"])
 
@@ -27,26 +28,6 @@ _COMPRESSOR = zstd.ZstdCompressor(level=9)
 
 # Default maximum total uncompressed bytes accepted per /complete upload.
 _DEFAULT_ARTIFACT_LIMIT = 100 * 1024 * 1024  # 100 MB
-
-
-class JobItem(BaseModel):
-  """Single pending run returned by GET /jobs/next."""
-
-  run_id: int
-  deck_id: int
-  deck_filename: str
-  # Base64-encoded raw (uncompressed) deck bytes.
-  deck_content: str
-  repo_name: str
-  commit_hash: str
-  repo_url: str
-
-
-class CompleteMetadata(BaseModel):
-  exit_code: int
-  # Optional free-text summary from valgrind (the full XML should be
-  # included as one of the uploaded files).
-  valgrind_summary: str | None = None
 
 
 class FailRequest(BaseModel):
