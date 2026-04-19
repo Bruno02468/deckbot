@@ -1439,7 +1439,7 @@ async def _auto_update_run(
       await message.edit(embed=embed, view=None if done else view)
       if done:
         break
-    except discord.HTTPException, asyncio.CancelledError:
+    except (discord.HTTPException, asyncio.CancelledError):
       # Message may have been deleted or we lost access — stop silently.
       break
 

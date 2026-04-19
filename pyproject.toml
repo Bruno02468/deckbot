@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 packages = ["deckbot"]
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py312"
 indent-width = 2
 line-length = 79
 
