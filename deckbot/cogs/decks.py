@@ -93,12 +93,6 @@ class RunDeckModal(discord.ui.Modal, title="Run deck with MYSTRAN"):
     min_length=1,
     max_length=10,
   )
-  repo_input = discord.ui.TextInput(
-    label="Repository",
-    placeholder=", ".join(APPROVED_REPOS.keys()) or "mystran",
-    min_length=1,
-    max_length=100,
-  )
   ref_input = discord.ui.TextInput(
     label="Branch / tag / commit",
     placeholder="e.g. main",
@@ -119,8 +113,8 @@ class RunDeckModal(discord.ui.Modal, title="Run deck with MYSTRAN"):
   async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
     await interaction.response.defer(thinking=True, ephemeral=self._ephemeral)
     raw_id = self.deck_id_input.value.strip()
-    repo = self.repo_input.value.strip()
     ref = self.ref_input.value.strip()
+    repo = next(iter(APPROVED_REPOS))
 
     try:
       deck_id = int(raw_id)
@@ -135,14 +129,6 @@ class RunDeckModal(discord.ui.Modal, title="Run deck with MYSTRAN"):
       if deck is None:
         await interaction.followup.send(
           f"No deck with ID `{deck_id}`.", ephemeral=True
-        )
-        return
-
-      if repo not in APPROVED_REPOS:
-        allowed = ", ".join(f"`{k}`" for k in APPROVED_REPOS)
-        await interaction.followup.send(
-          f"`{repo}` is not an approved repository. Allowed: {allowed}",
-          ephemeral=True,
         )
         return
 
@@ -711,17 +697,16 @@ class DecksCog(commands.Cog, name="Decks"):
   )
   @app_commands.describe(
     deck_id="Deck ID to run",
-    repo="Repository name (see /deck repos for the list)",
     ref="Branch, tag, or full commit SHA",
   )
   async def run_cmd(
     self,
     interaction: discord.Interaction,
     deck_id: int,
-    repo: str,
     ref: str,
   ) -> None:
     await interaction.response.defer(thinking=True)
+    repo = next(iter(APPROVED_REPOS))
 
     async with get_session() as session:
       deckbot_ch_id = await get_deckbot_channel_id(session)
@@ -731,14 +716,6 @@ class DecksCog(commands.Cog, name="Decks"):
       if deck is None:
         await interaction.followup.send(
           f"No deck with ID `{deck_id}`.", ephemeral=True
-        )
-        return
-
-      if repo not in APPROVED_REPOS:
-        allowed = ", ".join(f"`{k}`" for k in APPROVED_REPOS)
-        await interaction.followup.send(
-          f"`{repo}` is not an approved repository. Allowed: {allowed}",
-          ephemeral=True,
         )
         return
 
@@ -791,18 +768,6 @@ class DecksCog(commands.Cog, name="Decks"):
       _auto_update_run(msg, run_id, view, api_public_url)
     )
 
-  @run_cmd.autocomplete("repo")
-  async def _run_repo_autocomplete(
-    self,
-    interaction: discord.Interaction,
-    current: str,
-  ) -> list[app_commands.Choice[str]]:
-    return [
-      app_commands.Choice(name=k, value=k)
-      for k in APPROVED_REPOS
-      if current.lower() in k.lower()
-    ][:25]
-
   # ── /deck run-bulk ────────────────────────────────────────────────────────
 
   @deck.command(
@@ -810,7 +775,6 @@ class DecksCog(commands.Cog, name="Decks"):
     description="Queue MYSTRAN runs for all decks matching optional filters",
   )
   @app_commands.describe(
-    repo="Repository name",
     ref="Branch, tag, or full commit SHA",
     name="Filename substring filter",
     sol='SOL type filter (use "other" for unrecognised)',
@@ -822,7 +786,6 @@ class DecksCog(commands.Cog, name="Decks"):
   async def run_bulk_cmd(
     self,
     interaction: discord.Interaction,
-    repo: str,
     ref: str,
     name: str | None = None,
     sol: str | None = None,
@@ -832,18 +795,11 @@ class DecksCog(commands.Cog, name="Decks"):
     channel: discord.TextChannel | None = None,
   ) -> None:
     await interaction.response.defer(thinking=True)
+    repo = next(iter(APPROVED_REPOS))
 
     async with get_session() as session:
       deckbot_ch_id = await get_deckbot_channel_id(session)
       ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
-
-      if repo not in APPROVED_REPOS:
-        allowed = ", ".join(f"`{k}`" for k in APPROVED_REPOS)
-        await interaction.followup.send(
-          f"`{repo}` is not an approved repository. Allowed: {allowed}",
-          ephemeral=True,
-        )
-        return
 
       sol_filter: SolType | None = None
       if sol is not None:
@@ -952,18 +908,6 @@ class DecksCog(commands.Cog, name="Decks"):
         f"{skipped} deck(s) already had a pending/running run and were skipped."
       )
     await interaction.followup.send(" ".join(parts), ephemeral=ephemeral)
-
-  @run_bulk_cmd.autocomplete("repo")
-  async def _run_bulk_repo_autocomplete(
-    self,
-    interaction: discord.Interaction,
-    current: str,
-  ) -> list[app_commands.Choice[str]]:
-    return [
-      app_commands.Choice(name=k, value=k)
-      for k in APPROVED_REPOS
-      if current.lower() in k.lower()
-    ][:25]
 
   @run_bulk_cmd.autocomplete("sol")
   async def _run_bulk_sol_autocomplete(
