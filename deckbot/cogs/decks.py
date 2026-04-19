@@ -17,7 +17,7 @@ from discord.ext import commands
 
 from deckbot.cogs._checks import _is_deckbot_admin, admin_check as _admin_check
 from deckbot.config import get_settings
-from deckbot.db.models import Run
+from deckbot.db.models import Deck, Run
 from deckbot.db.queries import (
   DECKS_PER_PAGE,
   add_tag,
@@ -25,6 +25,7 @@ from deckbot.db.queries import (
   get_any_run_for_deck_version,
   get_deck,
   get_deckbot_channel_id,
+  get_decks_by_hashes,
   get_decks_by_message,
   get_or_create_version,
   get_run,
@@ -32,6 +33,8 @@ from deckbot.db.queries import (
   remove_tag,
   search_decks,
 )
+from deckbot.services.deck_parser import hash_deck
+from deckbot.services.zip_handler import DECK_EXTENSIONS, extract_decks
 from deckbot.db.session import get_session
 from deckbot.models.deck import DeckInfo
 from deckbot.models.repo import APPROVED_REPOS
@@ -39,6 +42,8 @@ from deckbot.models.sol import SolType, normalize_sol
 from deckbot.services.version_resolver import ResolveError, resolve_ref
 
 if TYPE_CHECKING:
+  from sqlalchemy.ext.asyncio import AsyncSession
+
   from deckbot.bot import DeckBot
 
 log = logging.getLogger(__name__)
@@ -388,6 +393,39 @@ class DeckPageView(discord.ui.View):
         await self.message.edit(view=self)
       except discord.HTTPException:
         pass
+
+
+async def _resolve_decks_from_message(
+  message: discord.Message,
+  session: AsyncSession,
+) -> list[Deck]:
+  """Find stored decks referenced by a message.
+
+  Tries source_message_id first; if nothing is found (e.g. the message
+  contained a duplicate deck that was silently skipped by the processor),
+  downloads attachments and looks up by content hash instead.
+  """
+  decks = await get_decks_by_message(session, message.id)
+  if decks:
+    return decks
+
+  # Fallback: hash attachments and look up by content.
+  hashes: list[str] = []
+  for attachment in message.attachments:
+    ext = PurePosixPath(attachment.filename).suffix.lower()
+    try:
+      data = await attachment.read()
+    except discord.HTTPException:
+      continue
+    if ext == ".zip":
+      for _, raw in extract_decks(data):
+        hashes.append(hash_deck(raw))
+    elif ext in DECK_EXTENSIONS:
+      hashes.append(hash_deck(data))
+
+  if not hashes:
+    return []
+  return await get_decks_by_hashes(session, hashes)
 
 
 class DecksCog(commands.Cog, name="Decks"):
@@ -1048,7 +1086,7 @@ class DecksCog(commands.Cog, name="Decks"):
     async with get_session() as session:
       deckbot_ch_id = await get_deckbot_channel_id(session)
       ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
-      decks = await get_decks_by_message(session, message.id)
+      decks = await _resolve_decks_from_message(message, session)
 
     if not decks:
       await interaction.response.send_message(
@@ -1080,7 +1118,7 @@ class DecksCog(commands.Cog, name="Decks"):
     async with get_session() as session:
       deckbot_ch_id = await get_deckbot_channel_id(session)
       ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
-      decks = await get_decks_by_message(session, message.id)
+      decks = await _resolve_decks_from_message(message, session)
 
     if not decks:
       await interaction.response.send_message(

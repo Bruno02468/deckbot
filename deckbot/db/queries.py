@@ -142,6 +142,19 @@ async def get_decks_by_message(
   return list(result.scalars().all())
 
 
+async def get_decks_by_hashes(
+  session: AsyncSession, hashes: list[str]
+) -> list[Deck]:
+  """Return decks matching any of the given SHA-256 hashes, ordered by id."""
+  result = await session.execute(
+    select(Deck)
+    .options(selectinload(Deck.tags))
+    .where(Deck.hash.in_(hashes))
+    .order_by(Deck.id)
+  )
+  return list(result.scalars().all())
+
+
 async def search_decks(
   session: AsyncSession,
   *,
