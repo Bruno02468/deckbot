@@ -351,6 +351,25 @@ async def get_active_run_for_deck_version(
   return result.scalar_one_or_none()
 
 
+async def get_any_run_for_deck_version(
+  session: AsyncSession, deck_id: int, version_id: int
+) -> Run | None:
+  """Return the most recent run for (deck, version), regardless of status."""
+  result = await session.execute(
+    select(Run)
+    .options(
+      selectinload(Run.deck),
+      selectinload(Run.version),
+      selectinload(Run.node),
+      selectinload(Run.files),
+    )
+    .where(Run.deck_id == deck_id, Run.version_id == version_id)
+    .order_by(Run.created_at.desc())
+    .limit(1)
+  )
+  return result.scalar_one_or_none()
+
+
 async def list_runs_for_deck(
   session: AsyncSession,
   deck_id: int,

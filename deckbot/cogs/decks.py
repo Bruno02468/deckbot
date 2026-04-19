@@ -22,7 +22,7 @@ from deckbot.db.queries import (
   DECKS_PER_PAGE,
   add_tag,
   fetch_deck_blobs,
-  get_active_run_for_deck_version,
+  get_any_run_for_deck_version,
   get_deck,
   get_deckbot_channel_id,
   get_decks_by_message,
@@ -146,14 +146,21 @@ class RunDeckModal(discord.ui.Modal, title="Run deck with MYSTRAN"):
       )
       await session.flush()
 
-      active = await get_active_run_for_deck_version(
+      existing = await get_any_run_for_deck_version(
         session, deck_id, version.id
       )
-      if active is not None:
+      if existing is not None:
+        api_public_url = get_settings().api_public_url
+        embed = _build_run_embed(existing, api_public_url)
+        embed.set_footer(
+          text=f"Cached — run #{existing.id} already exists for this "
+          "deck+version. Use Force Re-run to queue a new one."
+        )
+        view = _CachedRunView(
+          deck_id, version.id, self._ephemeral, api_public_url
+        )
         await interaction.followup.send(
-          f"Deck `#{deck_id}` already has a `{active.status}` run "
-          f"for `{repo}@{ref}` (run #{active.id}).",
-          ephemeral=self._ephemeral,
+          embed=embed, view=view, ephemeral=self._ephemeral
         )
         return
 
@@ -707,6 +714,7 @@ class DecksCog(commands.Cog, name="Decks"):
   ) -> None:
     await interaction.response.defer(thinking=True)
     repo = next(iter(APPROVED_REPOS))
+    api_public_url = get_settings().api_public_url
 
     async with get_session() as session:
       deckbot_ch_id = await get_deckbot_channel_id(session)
@@ -733,14 +741,18 @@ class DecksCog(commands.Cog, name="Decks"):
       )
       await session.flush()
 
-      active = await get_active_run_for_deck_version(
+      existing = await get_any_run_for_deck_version(
         session, deck_id, version.id
       )
-      if active is not None:
+      if existing is not None:
+        embed = _build_run_embed(existing, api_public_url)
+        embed.set_footer(
+          text=f"Cached — run #{existing.id} already exists for this "
+          "deck+version. Use Force Re-run to queue a new one."
+        )
+        view = _CachedRunView(deck_id, version.id, ephemeral, api_public_url)
         await interaction.followup.send(
-          f"Deck `#{deck_id}` already has a `{active.status}` run "
-          f"for `{repo}@{ref}` (run #{active.id}).",
-          ephemeral=ephemeral,
+          embed=embed, view=view, ephemeral=ephemeral
         )
         return
 
@@ -758,7 +770,6 @@ class DecksCog(commands.Cog, name="Decks"):
       run = await get_run(session, run_id)
       assert run is not None
 
-    api_public_url = get_settings().api_public_url
     view = RunStatusView(run_id, api_public_url)
     embed = _build_run_embed(run, api_public_url)
     msg = await interaction.followup.send(
@@ -882,10 +893,8 @@ class DecksCog(commands.Cog, name="Decks"):
       await session.flush()
 
       for did in all_deck_ids:
-        active = await get_active_run_for_deck_version(
-          session, did, version.id
-        )
-        if active is not None:
+        existing = await get_any_run_for_deck_version(session, did, version.id)
+        if existing is not None:
           skipped += 1
           continue
         session.add(
@@ -904,9 +913,7 @@ class DecksCog(commands.Cog, name="Decks"):
     ref_display = ref if ref == commit_hash else f"{ref} ({commit_hash[:8]})"
     parts = [f"Queued **{queued}** run(s) on `{repo}@{ref_display}`."]
     if skipped:
-      parts.append(
-        f"{skipped} deck(s) already had a pending/running run and were skipped."
-      )
+      parts.append(f"{skipped} deck(s) already had a run and were skipped.")
     await interaction.followup.send(" ".join(parts), ephemeral=ephemeral)
 
   @run_bulk_cmd.autocomplete("sol")
@@ -1355,6 +1362,55 @@ class RunStatusView(discord.ui.View):
     done = run.status in _TERMINAL_STATUSES
     await interaction.response.edit_message(
       embed=embed, view=None if done else self
+    )
+
+
+# ── Cached-run view ───────────────────────────────────────────────────────────
+
+
+class _CachedRunView(discord.ui.View):
+  """Shown when an existing run is found; offers a Force Re-run button."""
+
+  def __init__(
+    self,
+    deck_id: int,
+    version_id: int,
+    ephemeral: bool,
+    api_public_url: str | None,
+  ) -> None:
+    super().__init__(timeout=_VIEW_TIMEOUT)
+    self._deck_id = deck_id
+    self._version_id = version_id
+    self._ephemeral = ephemeral
+    self._api_public_url = api_public_url
+
+  @discord.ui.button(label="🔁 Force Re-run", style=discord.ButtonStyle.danger)
+  async def force_rerun(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    button.disabled = True
+    await interaction.response.defer()
+    async with get_session() as session:
+      run = Run(
+        deck_id=self._deck_id,
+        version_id=self._version_id,
+        status="pending",
+        submitted_by=interaction.user.id,
+        created_at=datetime.now(UTC),
+      )
+      session.add(run)
+      await session.commit()
+      run_id = run.id
+      run = await get_run(session, run_id)
+      assert run is not None
+    self.stop()
+    new_view = RunStatusView(run_id, self._api_public_url)
+    embed = _build_run_embed(run, self._api_public_url)
+    msg = await interaction.edit_original_response(embed=embed, view=new_view)
+    asyncio.get_event_loop().create_task(
+      _auto_update_run(msg, run_id, new_view, self._api_public_url)
     )
 
 
