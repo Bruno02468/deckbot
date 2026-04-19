@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import math
 import zipfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from deckbot.cogs._checks import _is_deckbot_admin, admin_check as _admin_check
+from deckbot.config import get_settings
 from deckbot.db.models import Run
 from deckbot.db.queries import (
   DECKS_PER_PAGE,
@@ -23,6 +25,7 @@ from deckbot.db.queries import (
   get_active_run_for_deck_version,
   get_deck,
   get_deckbot_channel_id,
+  get_decks_by_message,
   get_or_create_version,
   get_run,
   list_runs_for_deck,
@@ -79,6 +82,118 @@ def _build_zip(blobs: list[tuple[int, str, bytes]]) -> io.BytesIO:
 
 
 _VIEW_TIMEOUT = 120.0
+
+
+class RunDeckModal(discord.ui.Modal, title="Run deck with MYSTRAN"):
+  """Modal that queues a MYSTRAN run for a chosen deck."""
+
+  deck_id_input = discord.ui.TextInput(
+    label="Deck ID",
+    placeholder="e.g. 42",
+    min_length=1,
+    max_length=10,
+  )
+  repo_input = discord.ui.TextInput(
+    label="Repository",
+    placeholder=", ".join(APPROVED_REPOS.keys()) or "mystran",
+    min_length=1,
+    max_length=100,
+  )
+  ref_input = discord.ui.TextInput(
+    label="Branch / tag / commit",
+    placeholder="e.g. main",
+    min_length=1,
+    max_length=100,
+  )
+
+  def __init__(
+    self,
+    ephemeral: bool,
+    preset_deck_id: int | None = None,
+  ) -> None:
+    super().__init__()
+    self._ephemeral = ephemeral
+    if preset_deck_id is not None:
+      self.deck_id_input.default = str(preset_deck_id)
+
+  async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+    await interaction.response.defer(thinking=True, ephemeral=self._ephemeral)
+    raw_id = self.deck_id_input.value.strip()
+    repo = self.repo_input.value.strip()
+    ref = self.ref_input.value.strip()
+
+    try:
+      deck_id = int(raw_id)
+    except ValueError:
+      await interaction.followup.send(
+        f"`{raw_id}` is not a valid deck ID.", ephemeral=True
+      )
+      return
+
+    async with get_session() as session:
+      deck = await get_deck(session, deck_id)
+      if deck is None:
+        await interaction.followup.send(
+          f"No deck with ID `{deck_id}`.", ephemeral=True
+        )
+        return
+
+      if repo not in APPROVED_REPOS:
+        allowed = ", ".join(f"`{k}`" for k in APPROVED_REPOS)
+        await interaction.followup.send(
+          f"`{repo}` is not an approved repository. Allowed: {allowed}",
+          ephemeral=True,
+        )
+        return
+
+      try:
+        commit_hash = await resolve_ref(repo, ref)
+      except ResolveError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+
+      version = await get_or_create_version(
+        session,
+        repo,
+        commit_hash,
+        ref_name=ref if ref != commit_hash else None,
+      )
+      await session.flush()
+
+      active = await get_active_run_for_deck_version(
+        session, deck_id, version.id
+      )
+      if active is not None:
+        await interaction.followup.send(
+          f"Deck `#{deck_id}` already has a `{active.status}` run "
+          f"for `{repo}@{ref}` (run #{active.id}).",
+          ephemeral=self._ephemeral,
+        )
+        return
+
+      run = Run(
+        deck_id=deck_id,
+        version_id=version.id,
+        status="pending",
+        submitted_by=interaction.user.id,
+        created_at=datetime.now(UTC),
+      )
+      session.add(run)
+      await session.commit()
+      run_id = run.id
+      # Re-fetch with full relations for the embed.
+      run = await get_run(session, run_id)
+      assert run is not None
+
+    api_public_url = get_settings().api_public_url
+    view = RunStatusView(run_id, api_public_url)
+    embed = _build_run_embed(run, api_public_url)
+    msg = await interaction.followup.send(
+      embed=embed, view=view, ephemeral=self._ephemeral, wait=True
+    )
+    asyncio.get_event_loop().create_task(
+      _auto_update_run(msg, run_id, view, api_public_url)
+    )
 
 
 def _fmt_size(n: int) -> str:
@@ -262,11 +377,19 @@ class DeckPageView(discord.ui.View):
       ephemeral=self._ephemeral,
     )
 
+  @discord.ui.button(label="▶ Run...", style=discord.ButtonStyle.success)
+  async def run_button(
+    self, interaction: discord.Interaction, button: discord.ui.Button[Any]
+  ) -> None:
+    modal = RunDeckModal(ephemeral=self._ephemeral)
+    await interaction.response.send_modal(modal)
+
   async def on_timeout(self) -> None:
     # Disable buttons in-place when the view expires.
     self.prev_button.disabled = True
     self.next_button.disabled = True
     self.download_button.disabled = True
+    self.run_button.disabled = True
     if self.message is not None:
       try:
         await self.message.edit(view=self)
@@ -654,11 +777,18 @@ class DecksCog(commands.Cog, name="Decks"):
       session.add(run)
       await session.commit()
       run_id = run.id
+      # Re-fetch with full relations for the embed.
+      run = await get_run(session, run_id)
+      assert run is not None
 
-    ref_display = ref if ref == commit_hash else f"{ref} ({commit_hash[:8]})"
-    await interaction.followup.send(
-      f"Run `#{run_id}` queued: deck `#{deck_id}` on `{repo}@{ref_display}`.",
-      ephemeral=ephemeral,
+    api_public_url = get_settings().api_public_url
+    view = RunStatusView(run_id, api_public_url)
+    embed = _build_run_embed(run, api_public_url)
+    msg = await interaction.followup.send(
+      embed=embed, view=view, ephemeral=ephemeral, wait=True
+    )
+    asyncio.get_event_loop().create_task(
+      _auto_update_run(msg, run_id, view, api_public_url)
     )
 
   @run_cmd.autocomplete("repo")
@@ -949,60 +1079,108 @@ class DecksCog(commands.Cog, name="Decks"):
       )
       return
 
+    api_public_url = get_settings().api_public_url
+    embed = _build_run_embed(run, api_public_url)
+    done = run.status in _TERMINAL_STATUSES
+    view = None if done else RunStatusView(run_id, api_public_url)
+    await interaction.response.send_message(
+      embed=embed, view=view, ephemeral=ephemeral
+    )
+
+  # ── Context menu: "Run this deck" ─────────────────────────────────────────
+
+  async def _ctx_run_deck(
+    self,
+    interaction: discord.Interaction,
+    message: discord.Message,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+      decks = await get_decks_by_message(session, message.id)
+
+    if not decks:
+      await interaction.response.send_message(
+        "No processed deck found in that message.", ephemeral=True
+      )
+      return
+
+    if len(decks) == 1:
+      modal = RunDeckModal(ephemeral=ephemeral, preset_deck_id=decks[0].id)
+      await interaction.response.send_modal(modal)
+      return
+
+    # Multiple decks (e.g. from a zip) — let the user pick first.
+    view = _DeckSelectView(decks, ephemeral)
+    desc = "\n".join(f"`#{d.id}` {d.filename}" for d in decks)
+    await interaction.response.send_message(
+      f"That message contains **{len(decks)}** decks. Pick one to run:\n{desc}",
+      view=view,
+      ephemeral=True,
+    )
+
+  # ── Context menu: "Deck info" ──────────────────────────────────────────────
+
+  async def _ctx_deck_info(
+    self,
+    interaction: discord.Interaction,
+    message: discord.Message,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+      decks = await get_decks_by_message(session, message.id)
+
+    if not decks:
+      await interaction.response.send_message(
+        "No processed deck found in that message.", ephemeral=True
+      )
+      return
+
     embed = discord.Embed(
-      title=f"Run #{run_id}",
-      colour=_run_colour(run.status),
+      title=f"Deck info — {len(decks)} deck(s) from that message",
+      colour=discord.Colour.orange(),
     )
-    embed.add_field(
-      name="Deck",
-      value=f"#{run.deck_id} `{run.deck.filename}`",
-      inline=True,
-    )
-    embed.add_field(
-      name="Version",
-      value=(
-        f"`{run.version.repo_name}@"
-        f"{run.version.ref_name or run.version.commit_hash[:8]}`"
-      ),
-      inline=True,
-    )
-    embed.add_field(
-      name="Status",
-      value=f"{_RUN_EMOJI.get(run.status, '❓')} `{run.status}`",
-      inline=True,
-    )
-    if run.node:
-      embed.add_field(name="Node", value=f"`{run.node.name}`", inline=True)
-    if run.exit_code is not None:
-      embed.add_field(
-        name="Exit code", value=f"`{run.exit_code}`", inline=True
-      )
-    embed.add_field(
-      name="Queued",
-      value=run.created_at.strftime("%Y-%m-%d %H:%M UTC"),
-      inline=True,
-    )
-    if run.started_at:
-      embed.add_field(
-        name="Started",
-        value=run.started_at.strftime("%Y-%m-%d %H:%M UTC"),
-        inline=True,
-      )
-    if run.completed_at:
-      embed.add_field(
-        name="Completed",
-        value=run.completed_at.strftime("%Y-%m-%d %H:%M UTC"),
-        inline=True,
-      )
-    if run.error:
-      short = run.error[:300]
-      if len(run.error) > 300:
-        short += "…"
-      embed.add_field(
-        name="Error / notes", value=f"```{short}```", inline=False
-      )
+    for d in decks:
+      info = DeckInfo.model_validate(d)
+      field_name, field_value = _fmt_deck(info)
+      embed.add_field(name=field_name, value=field_value, inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+
+# ── Deck-select view (context menu, multi-deck messages) ──────────────────────
+
+
+class _DeckSelectView(discord.ui.View):
+  """Select menu to pick one deck from a multi-deck message, then run it."""
+
+  def __init__(
+    self,
+    decks: list,  # list[Deck] — avoid circular import typing
+    ephemeral: bool,
+  ) -> None:
+    super().__init__(timeout=60.0)
+    self._ephemeral = ephemeral
+    self.select.options = [
+      discord.SelectOption(
+        label=f"#{d.id} {d.filename[:90]}",
+        value=str(d.id),
+        description=(f"SOL: {d.sol or '—'}  GRIDs: {d.grid_count}"),
+      )
+      for d in decks[:25]
+    ]
+
+  @discord.ui.select(placeholder="Choose a deck…")
+  async def select(
+    self,
+    interaction: discord.Interaction,
+    item: discord.ui.Select[Any],
+  ) -> None:
+    deck_id = int(item.values[0])
+    modal = RunDeckModal(ephemeral=self._ephemeral, preset_deck_id=deck_id)
+    await interaction.response.send_modal(modal)
+    self.stop()
 
 
 # ── Run formatting helpers ────────────────────────────────────────────────────
@@ -1025,6 +1203,152 @@ def _run_colour(status: str) -> discord.Colour:
   }.get(status, discord.Colour.orange())
 
 
+def _fmt_elapsed(delta: timedelta) -> str:
+  total = int(delta.total_seconds())
+  if total < 0:
+    total = 0
+  h, rem = divmod(total, 3600)
+  m, s = divmod(rem, 60)
+  if h:
+    return f"{h}h {m}m {s}s"
+  if m:
+    return f"{m}m {s}s"
+  return f"{s}s"
+
+
+def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
+  """Build the canonical embed for a single run."""
+  embed = discord.Embed(
+    title=f"Run #{run.id}",
+    colour=_run_colour(run.status),
+  )
+
+  # ── Row 1: Deck · Version · Status ───────────────────────────────────────
+  embed.add_field(
+    name="Deck",
+    value=f"#{run.deck_id} `{run.deck.filename}`",
+    inline=True,
+  )
+  ref = run.version.ref_name or run.version.commit_hash[:8]
+  version_value = f"`{run.version.repo_name}@{ref}`"
+  if run.version.ref_name:
+    version_value += f"\n`{run.version.commit_hash[:8]}`"
+  embed.add_field(
+    name="Version",
+    value=version_value,
+    inline=True,
+  )
+  embed.add_field(
+    name="Status",
+    value=f"{_RUN_EMOJI.get(run.status, '❓')} `{run.status}`",
+    inline=True,
+  )
+
+  # ── Row 2: Queued · Completed/Started/— · Elapsed/Running for/Waiting ────
+  now = datetime.now(UTC)
+  created = run.created_at.replace(tzinfo=UTC)
+  embed.add_field(
+    name="Queued",
+    value=created.strftime("%Y-%m-%d %H:%M UTC"),
+    inline=True,
+  )
+
+  if run.status == "pending":
+    embed.add_field(name="Completed", value="—", inline=True)
+    embed.add_field(
+      name="Waiting", value=_fmt_elapsed(now - created), inline=True
+    )
+  elif run.status == "running" and run.started_at:
+    started = run.started_at.replace(tzinfo=UTC)
+    embed.add_field(
+      name="Started",
+      value=started.strftime("%Y-%m-%d %H:%M UTC"),
+      inline=True,
+    )
+    embed.add_field(
+      name="Running for",
+      value=_fmt_elapsed(now - started),
+      inline=True,
+    )
+  elif run.completed_at:
+    embed.add_field(
+      name="Completed",
+      value=run.completed_at.replace(tzinfo=UTC).strftime(
+        "%Y-%m-%d %H:%M UTC"
+      ),
+      inline=True,
+    )
+    if run.started_at:
+      elapsed = _fmt_elapsed(
+        run.completed_at.replace(tzinfo=UTC)
+        - run.started_at.replace(tzinfo=UTC)
+      )
+      embed.add_field(name="Elapsed", value=elapsed, inline=True)
+    else:
+      embed.add_field(name="Elapsed", value="—", inline=True)
+  else:
+    embed.add_field(name="Completed", value="—", inline=True)
+    embed.add_field(name="Elapsed", value="—", inline=True)
+
+  # ── Row 3 (completed): Output files · Finish · Valgrind ──────────────────
+  if run.status == "completed":
+    # Output file links.
+    run_files = getattr(run, "files", []) or []
+    links: list[str] = []
+    if api_public_url:
+      base = api_public_url.rstrip("/")
+      f06 = next(
+        (f for f in run_files if f.filename.lower().endswith(".f06")), None
+      )
+      op2 = next(
+        (f for f in run_files if f.filename.lower().endswith(".op2")), None
+      )
+      if f06:
+        links.append(f"[F06]({base}/run/{run.id}/files/{f06.filename})")
+      if op2:
+        links.append(f"[OP2]({base}/run/{run.id}/files/{op2.filename})")
+      if run_files:
+        links.append(f"[results]({base}/run/{run.id}/zip)")
+    embed.add_field(
+      name="Output files",
+      value=" · ".join(links) if links else "—",
+      inline=True,
+    )
+
+    # Finish classification.
+    finish = getattr(run, "finish", None)
+    _FINISH_EMOJI = {"normal": "✅", "fatal": "⚠️", "crash": "💥"}
+    embed.add_field(
+      name="Finish",
+      value=(
+        f"{_FINISH_EMOJI.get(finish, '❓')} `{finish}`"
+        if finish is not None
+        else "—"
+      ),
+      inline=True,
+    )
+
+    # Valgrind error count.
+    verrs = getattr(run, "valgrind_errors", None)
+    embed.add_field(
+      name="Valgrind",
+      value=(
+        f"{'🧹' if verrs == 0 else '🐛'} `{verrs} error(s)`"
+        if verrs is not None
+        else "—"
+      ),
+      inline=True,
+    )
+
+  if run.error:
+    short = run.error[:300]
+    if len(run.error) > 300:
+      short += "…"
+    embed.add_field(name="Error / notes", value=f"```{short}```", inline=False)
+
+  return embed
+
+
 def _add_run_field(embed: discord.Embed, run: Run) -> None:
   emoji = _RUN_EMOJI.get(run.status, "❓")
   ref = run.version.ref_name or run.version.commit_hash[:8]
@@ -1032,10 +1356,92 @@ def _add_run_field(embed: discord.Embed, run: Run) -> None:
   parts = [f"status: `{run.status}`"]
   if run.node:
     parts.append(f"node: `{run.node.name}`")
-  if run.exit_code is not None:
-    parts.append(f"exit: `{run.exit_code}`")
-  parts.append(run.created_at.strftime("%Y-%m-%d %H:%M UTC"))
+
+  # Show elapsed / duration.
+  now = datetime.now(UTC)
+  created = run.created_at.replace(tzinfo=UTC)
+  if run.status == "pending":
+    parts.append(f"waiting {_fmt_elapsed(now - created)}")
+  elif run.status == "running" and run.started_at:
+    started = run.started_at.replace(tzinfo=UTC)
+    parts.append(f"running {_fmt_elapsed(now - started)}")
+  elif run.completed_at and run.started_at:
+    elapsed = _fmt_elapsed(
+      run.completed_at.replace(tzinfo=UTC) - run.started_at.replace(tzinfo=UTC)
+    )
+    parts.append(f"took {elapsed}")
+
+  finish = getattr(run, "finish", None)
+  if finish is not None:
+    _FINISH_EMOJI = {"normal": "✅", "fatal": "⚠️", "crash": "💥"}
+    parts.append(f"{_FINISH_EMOJI.get(finish, '❓')} {finish}")
+  verrs = getattr(run, "valgrind_errors", None)
+  if verrs is not None:
+    parts.append(f"{'🧹' if verrs == 0 else '🐛'} {verrs} valgrind error(s)")
+
+  parts.append(created.strftime("%Y-%m-%d %H:%M UTC"))
   embed.add_field(name=name, value=" · ".join(parts), inline=False)
+
+
+# ── Run-status live view ──────────────────────────────────────────────────────
+
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+class RunStatusView(discord.ui.View):
+  """A persistent embed for a single run with a manual refresh button."""
+
+  def __init__(self, run_id: int, api_public_url: str | None) -> None:
+    super().__init__(timeout=None)
+    self._run_id = run_id
+    self._api_public_url = api_public_url
+
+  @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+  async def refresh(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    async with get_session() as session:
+      run = await get_run(session, self._run_id)
+    if run is None:
+      await interaction.response.send_message("Run not found.", ephemeral=True)
+      return
+    embed = _build_run_embed(run, self._api_public_url)
+    done = run.status in _TERMINAL_STATUSES
+    await interaction.response.edit_message(
+      embed=embed, view=None if done else self
+    )
+
+
+async def _auto_update_run(
+  message: discord.Message,
+  run_id: int,
+  view: RunStatusView,
+  api_public_url: str | None,
+) -> None:
+  """Background task: edit *message* with fresh run status on a schedule.
+
+  Schedule: every 10 s for the first minute, then every 60 s for 10 minutes.
+  Stops early when the run reaches a terminal state.
+  """
+  # 6 × 10 s = 60 s, then 10 × 60 s = 600 s
+  schedule = [10] * 6 + [60] * 10
+  for delay in schedule:
+    await asyncio.sleep(delay)
+    try:
+      async with get_session() as session:
+        run = await get_run(session, run_id)
+      if run is None:
+        break
+      embed = _build_run_embed(run, api_public_url)
+      done = run.status in _TERMINAL_STATUSES
+      await message.edit(embed=embed, view=None if done else view)
+      if done:
+        break
+    except discord.HTTPException, Exception:
+      # Message may have been deleted or we lost access — stop silently.
+      break
 
 
 # ── Bulk-run confirmation view ────────────────────────────────────────────────
@@ -1089,4 +1495,21 @@ async def _confirm_bulk(
 
 
 async def setup(bot: commands.Bot) -> None:
-  await bot.add_cog(DecksCog(bot))  # type: ignore[arg-type]
+  cog = DecksCog(bot)  # type: ignore[arg-type]
+  await bot.add_cog(cog)
+  # Context menu commands must be added to the bot's command tree directly
+  # (they cannot live inside a Cog group).
+  bot.tree.add_command(  # type: ignore[arg-type]
+    app_commands.ContextMenu(
+      name="Run this deck",
+      callback=cog._ctx_run_deck,
+      guild_ids=[get_settings().discord_guild_id],
+    )
+  )
+  bot.tree.add_command(  # type: ignore[arg-type]
+    app_commands.ContextMenu(
+      name="Deck info",
+      callback=cog._ctx_deck_info,
+      guild_ids=[get_settings().discord_guild_id],
+    )
+  )

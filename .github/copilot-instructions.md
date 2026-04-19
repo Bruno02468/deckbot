@@ -114,7 +114,7 @@ deckbot-node.service — systemd unit template for volunteer compute nodes
 - **Approved repos**: static dict in `models/repo.py`. Currently: `{"mystran": "https://github.com/MYSTRANsolver/MYSTRAN.git"}`. Version refs are resolved to full SHA-1 via `git ls-remote`.
 - **Node API auth**: `X-API-Key` header; key is SHA-256-hashed before storage. Key is shown exactly once at node creation (`/deckbot node-create`).
 - **Binary cache**: nodes cache built binaries at `{build_cache_dir}/binaries/{repo_name}/{commit_hash}/mystran`. Build uses CMake `Debug` mode. Shared repo clone lives at `{build_cache_dir}/repos/{repo_name}/`. One asyncio.Lock per repo prevents concurrent builds.
-- **Sandbox**: each run executes `firejail --net=none valgrind --tool=memcheck --xml=yes {binary} {deck}` with `cwd` set to an isolated work directory. All output files (excluding the input deck) are uploaded to the API as multipart on completion.
+- **Sandbox**: each run executes `valgrind --tool=memcheck --xml=yes --track-origins=yes --read-inline-info=yes --read-var-info=yes --expensive-definedness-checks=yes {binary} {deck}` with `cwd` set to an isolated work directory. firejail is **not** used (incompatible with valgrind). All output files (excluding the input deck) are uploaded to the API as multipart on completion.
 
 ## What is NOT yet implemented
 

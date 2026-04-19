@@ -30,9 +30,8 @@ async def run_job(
   """Execute one job end-to-end: build → sandbox → collect → upload.
 
   Creates a temporary work directory, writes the deck there, builds (or
-  retrieves) the MYSTRAN binary, runs it under firejail + valgrind, then
-  uploads all output files to the API.  The work directory is always
-  cleaned up on exit.
+  retrieves) the MYSTRAN binary, runs it under valgrind, then uploads all
+  output files to the API.  The work directory is always cleaned up on exit.
   """
   config.work_base_dir.mkdir(parents=True, exist_ok=True)
   work_dir = Path(
@@ -64,8 +63,9 @@ async def _execute(
   work_dir: Path,
 ) -> None:
   # ── Write deck to work dir ──────────────────────────────────────────────
-  deck_ext = Path(job.deck_filename).suffix or ".bdf"
-  deck_path = work_dir / f"deck{deck_ext}"
+  # Keep the original filename so MYSTRAN names its output files accordingly
+  # (e.g. foo.DAT → foo.F06 rather than deck.F06).
+  deck_path = work_dir / job.deck_filename
   deck_path.write_bytes(base64.b64decode(job.deck_content))
 
   # ── Build / retrieve MYSTRAN binary ────────────────────────────────────
@@ -79,7 +79,7 @@ async def _execute(
     job.repo_name, job.repo_url, job.commit_hash, config
   )
 
-  # ── Run under firejail + valgrind ───────────────────────────────────────
+  # ── Run under valgrind ──────────────────────────────────────────────────
   valgrind_xml = work_dir / "valgrind.xml"
   cmd = build_command(binary, deck_path, valgrind_xml)
 
@@ -99,13 +99,23 @@ async def _execute(
   (work_dir / "stderr.txt").write_bytes(stderr_bytes)
   log.info("Run #%d: exit_code=%d", job.run_id, exit_code)
 
-  # ── Parse a short valgrind summary ─────────────────────────────────────
-  valgrind_summary: str | None = None
+  # ── Parse valgrind XML ──────────────────────────────────────────────────
+  valgrind_errors: int | None = None
   if valgrind_xml.exists():
     xml_text = valgrind_xml.read_text(errors="replace")
-    m = re.search(r"<errorcounts>.*?</errorcounts>", xml_text, re.DOTALL)
-    if m:
-      valgrind_summary = m.group(0)[:500]
+    # Count individual <error> elements reported by memcheck.
+    valgrind_errors = len(re.findall(r"<error>", xml_text))
+
+  # ── Determine finish classification ────────────────────────────────────
+  # Check the F06 for a controlled MYSTRAN fatal before looking at exit code.
+  f06_files = list(work_dir.glob("*.f06")) + list(work_dir.glob("*.F06"))
+  finish: str
+  if f06_files and "FATAL MESSAGE" in f06_files[0].read_text(errors="replace"):
+    finish = "fatal"
+  elif exit_code != 0:
+    finish = "crash"
+  else:
+    finish = "normal"
 
   # ── Collect output files ────────────────────────────────────────────────
   # Upload everything in the work dir except the original input deck.
@@ -117,7 +127,9 @@ async def _execute(
 
   # ── Upload results ──────────────────────────────────────────────────────
   meta = CompleteMetadata(
-    exit_code=exit_code, valgrind_summary=valgrind_summary
+    exit_code=exit_code,
+    finish=finish,
+    valgrind_errors=valgrind_errors,
   )
   file_parts: list[tuple[str, tuple[str, bytes, str]]] = [
     ("files", (f.name, f.read_bytes(), "application/octet-stream"))

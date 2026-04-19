@@ -165,12 +165,9 @@ async def complete_job(
 
   run.status = "completed"
   run.exit_code = meta.exit_code
+  run.finish = meta.finish
+  run.valgrind_errors = meta.valgrind_errors
   run.completed_at = datetime.now(UTC)
-  if meta.valgrind_summary is not None:
-    # Store the summary as the error field only when the exit code indicates
-    # a valgrind error, so normal runs keep error=NULL.
-    if meta.exit_code != 0:
-      run.error = meta.valgrind_summary
 
   await session.commit()
 

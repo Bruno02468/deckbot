@@ -202,6 +202,10 @@ class Run(Base):
     DateTime(timezone=True), nullable=True
   )
   exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+  # "normal" | "fatal" | "crash" — null until the run completes.
+  finish: Mapped[str | None] = mapped_column(String(20), nullable=True)
+  # Number of valgrind error records; 0 = clean, null = no XML produced.
+  valgrind_errors: Mapped[int | None] = mapped_column(Integer, nullable=True)
   error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
   deck: Mapped[Deck] = relationship("Deck", back_populates="runs")

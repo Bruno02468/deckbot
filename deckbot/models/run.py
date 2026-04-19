@@ -23,5 +23,7 @@ class CompleteMetadata(BaseModel):
   """Metadata sent by the node on ``POST /api/v1/jobs/{id}/complete``."""
 
   exit_code: int
-  # Short valgrind summary (first 500 chars of the errorcounts block).
-  valgrind_summary: str | None = None
+  # "normal" | "fatal" | "crash" — derived by the node from the F06 + exit code.
+  finish: str | None = None
+  # Total number of valgrind error records from the XML; None = no XML.
+  valgrind_errors: int | None = None

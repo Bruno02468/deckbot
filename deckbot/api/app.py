@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from deckbot.api.routers import jobs, nodes
+from deckbot.api.routers import files, jobs, nodes
 from deckbot.db.session import enable_wal
 
 
@@ -23,6 +23,7 @@ def create_app() -> FastAPI:
   )
   app.include_router(nodes.router, prefix="/api/v1")
   app.include_router(jobs.router, prefix="/api/v1")
+  app.include_router(files.router)
   return app
 
 

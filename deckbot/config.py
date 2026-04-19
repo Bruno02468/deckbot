@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     default=Path("deckbot.db"),
     description="Path to the SQLite database file",
   )
+  api_public_url: str | None = Field(
+    default=None,
+    description=(
+      "Public base URL of the DeckBot API server, e.g. "
+      "https://myserver.com/deckbot_api — used to build F06/zip links "
+      "in run embeds. Leave unset to omit file links."
+    ),
+  )
 
 
 _settings: Settings | None = None

@@ -129,6 +129,19 @@ async def get_deck(session: AsyncSession, deck_id: int) -> Deck | None:
   return result.scalar_one_or_none()
 
 
+async def get_decks_by_message(
+  session: AsyncSession, message_id: int
+) -> list[Deck]:
+  """Return all decks whose source message is *message_id*."""
+  result = await session.execute(
+    select(Deck)
+    .options(selectinload(Deck.tags))
+    .where(Deck.source_message_id == message_id)
+    .order_by(Deck.id)
+  )
+  return list(result.scalars().all())
+
+
 async def search_decks(
   session: AsyncSession,
   *,
@@ -317,6 +330,7 @@ async def get_run(session: AsyncSession, run_id: int) -> Run | None:
       selectinload(Run.deck),
       selectinload(Run.version),
       selectinload(Run.node),
+      selectinload(Run.files),
     )
     .where(Run.id == run_id)
   )
