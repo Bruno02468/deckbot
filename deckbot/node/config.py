@@ -25,6 +25,7 @@ class NodeSettings(BaseSettings):
     env_file=".env",
     env_file_encoding="utf-8",
     env_prefix="NODE_",
+    extra="ignore",
   )
 
   api_endpoint: str = Field(
@@ -44,9 +45,6 @@ class NodeSettings(BaseSettings):
     default=Path("/tmp/deckbot_node/work"),
     description="Parent directory for per-run temporary work directories",
   )
-  # Build type passed to CMake.  RelWithDebInfo gives debug symbols while
-  # still being fast enough for correctness testing.
-  build_type: str = Field(default="RelWithDebInfo")
   # How often (seconds) to poll for new jobs when idle.
   poll_interval: float = Field(default=10.0, ge=1.0)
   # How often (seconds) to send a keepalive to the API.

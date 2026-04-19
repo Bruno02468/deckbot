@@ -494,7 +494,9 @@ class AdminCog(commands.Cog, name="Admin"):
           status = "🚫 disabled"
         elif node.last_seen_at is None:
           status = "❓ never seen"
-        elif (now - node.last_seen_at) <= timedelta(seconds=node_timeout):
+        elif (now - node.last_seen_at.replace(tzinfo=UTC)) <= timedelta(
+          seconds=node_timeout
+        ):
           status = "🟢 online"
         else:
           status = "🔴 offline"

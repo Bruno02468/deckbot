@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shutil
 from pathlib import Path
 
@@ -100,8 +99,9 @@ async def _build(
   # ── Clean working tree ──────────────────────────────────────────────────
   log.info("[%s] Cleaning repo ...", repo_name)
   for cmd in [
-    ["git", "clean", "-fdx"],
-    ["git", "reset", "--hard"],
+    # Submodules first (matches mystran_picker order), then main repo.
+    # Cleaning submodules before the main repo avoids losing their
+    # directories before git-submodule-foreach can reach them.
     [
       "git",
       "submodule",
@@ -120,6 +120,8 @@ async def _build(
       "reset",
       "--hard",
     ],
+    ["git", "clean", "-fdx"],
+    ["git", "reset", "--hard"],
   ]:
     await _run(cmd, repo_dir)  # best-effort; ignore failures
 
@@ -144,7 +146,7 @@ async def _build(
       "cmake",
       "-G",
       "Unix Makefiles",
-      f"-DCMAKE_BUILD_TYPE={config.build_type}",
+      "-DCMAKE_BUILD_TYPE=Debug",
       "-Denable_internal_blaslib=yes",
       ".",
     ],
@@ -154,11 +156,7 @@ async def _build(
     raise RuntimeError(f"cmake configure failed: {err.strip()}")
 
   # ── CMake build ─────────────────────────────────────────────────────────
-  try:
-    jobs = str((os.cpu_count() or 4) + 1)
-  except Exception:
-    jobs = "5"
-
+  jobs = str(config.max_threads)
   log.info("[%s] Building with -j%s ...", repo_name, jobs)
   rc, _, err = await _run(["cmake", "--build", ".", f"-j{jobs}"], repo_dir)
   if rc != 0:

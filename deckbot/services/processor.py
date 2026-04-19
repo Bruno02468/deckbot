@@ -128,6 +128,7 @@ async def _store_deck(
       source_message_id=message.id,
       source_channel_id=message.channel.id,
       source_url=message.jump_url,
+      discovered_at=message.created_at,
     )
   )
   log.info(
