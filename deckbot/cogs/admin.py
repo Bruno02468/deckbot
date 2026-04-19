@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from deckbot.db.models import Channel, Job
+from deckbot.db.models import Channel, Job, Node
 from deckbot.db.queries import (
   count_channels,
   count_decks,
   count_jobs_by_status,
   get_deckbot_channel_id,
+  get_node_by_name,
+  get_setting,
   list_channels,
+  list_nodes,
   list_recent_jobs,
   set_setting,
 )
 from deckbot.db.session import get_session
 from deckbot.models.job import CrawlChannelPayload, ReprocessChannelPayload
+from deckbot.models.repo import APPROVED_REPOS
 from deckbot.cogs._checks import _is_deckbot_admin, admin_check as _admin_check
 
 if TYPE_CHECKING:
@@ -412,6 +419,162 @@ class AdminCog(commands.Cog, name="Admin"):
     await interaction.response.send_message(
       embed=embed,
       ephemeral=_is_ephemeral(interaction, deckbot_ch_id),
+    )
+
+  # ── /deckbot node ─────────────────────────────────────────────────────────
+
+  node_group = app_commands.Group(
+    name="node",
+    description="Manage compute nodes",
+    parent=None,  # attached via deckbot group below
+  )
+
+  @deckbot.command(
+    name="node-create",
+    description="Register a new compute node and generate its API key",
+  )
+  @app_commands.describe(name="Short identifier for the node")
+  @app_commands.check(_admin_check)
+  async def node_create(
+    self,
+    interaction: discord.Interaction,
+    name: str,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      existing = await get_node_by_name(session, name)
+      if existing is not None:
+        await interaction.response.send_message(
+          f"A node named `{name}` already exists.", ephemeral=True
+        )
+        return
+
+      raw_key = secrets.token_hex(32)
+      key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+      session.add(
+        Node(
+          name=name,
+          api_key_hash=key_hash,
+          created_by=interaction.user.id,
+          created_at=datetime.now(UTC),
+          is_active=True,
+        )
+      )
+      await session.commit()
+
+    # The key is shown exactly once and never stored in plaintext.
+    await interaction.response.send_message(
+      f"Node **{name}** registered.\n"
+      f"API key (shown once — store it now):\n```\n{raw_key}\n```",
+      ephemeral=True,
+    )
+
+  @deckbot.command(
+    name="node-list",
+    description="List registered compute nodes",
+  )
+  @app_commands.check(_admin_check)
+  async def node_list(self, interaction: discord.Interaction) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      nodes = await list_nodes(session)
+      node_timeout_raw = await get_setting(session, "node_timeout_seconds")
+
+    node_timeout = int(node_timeout_raw) if node_timeout_raw else 300
+    now = datetime.now(UTC)
+
+    if not nodes:
+      description = "_No nodes registered._"
+    else:
+      lines: list[str] = []
+      for node in nodes:
+        if not node.is_active:
+          status = "🚫 disabled"
+        elif node.last_seen_at is None:
+          status = "❓ never seen"
+        elif (now - node.last_seen_at) <= timedelta(seconds=node_timeout):
+          status = "🟢 online"
+        else:
+          status = "🔴 offline"
+
+        threads = (
+          f"{node.max_threads}t" if node.max_threads is not None else "?"
+        )
+        last = (
+          node.last_seen_at.strftime("%Y-%m-%d %H:%M UTC")
+          if node.last_seen_at
+          else "never"
+        )
+        lines.append(
+          f"**{node.name}** — {status} · {threads} · last seen: {last}"
+        )
+      description = "\n".join(lines)
+
+    embed = discord.Embed(
+      title=f"Compute Nodes ({len(nodes)})",
+      description=description,
+      colour=discord.Colour.blurple(),
+    )
+    await interaction.response.send_message(
+      embed=embed, ephemeral=_is_ephemeral(interaction, deckbot_ch_id)
+    )
+
+  @deckbot.command(
+    name="node-remove",
+    description="Deactivate a compute node (running jobs are re-queued)",
+  )
+  @app_commands.describe(name="Name of the node to deactivate")
+  @app_commands.check(_admin_check)
+  async def node_remove(
+    self,
+    interaction: discord.Interaction,
+    name: str,
+  ) -> None:
+    from sqlalchemy import select, update
+
+    from deckbot.db.models import Run
+
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      node = await get_node_by_name(session, name)
+      if node is None:
+        await interaction.response.send_message(
+          f"No node named `{name}`.", ephemeral=True
+        )
+        return
+
+      if not node.is_active:
+        await interaction.response.send_message(
+          f"Node `{name}` is already inactive.", ephemeral=ephemeral
+        )
+        return
+
+      node.is_active = False
+
+      # Reset any running jobs that were assigned to this node back to pending.
+      result = await session.execute(
+        select(Run).where(
+          Run.node_id == node.id,
+          Run.status == "running",
+        )
+      )
+      reset_runs = result.scalars().all()
+      for run in reset_runs:
+        run.status = "pending"
+        run.node_id = None
+        run.started_at = None
+
+      await session.commit()
+
+    reset_msg = (
+      f" {len(reset_runs)} running job(s) re-queued." if reset_runs else ""
+    )
+    await interaction.response.send_message(
+      f"Node `{name}` deactivated.{reset_msg}", ephemeral=ephemeral
     )
 
 

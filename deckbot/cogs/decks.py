@@ -5,6 +5,7 @@ import logging
 import math
 import zipfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -14,18 +15,25 @@ from discord import app_commands
 from discord.ext import commands
 
 from deckbot.cogs._checks import _is_deckbot_admin, admin_check as _admin_check
+from deckbot.db.models import Run
 from deckbot.db.queries import (
   DECKS_PER_PAGE,
   add_tag,
   fetch_deck_blobs,
+  get_active_run_for_deck_version,
   get_deck,
   get_deckbot_channel_id,
+  get_or_create_version,
+  get_run,
+  list_runs_for_deck,
   remove_tag,
   search_decks,
 )
 from deckbot.db.session import get_session
 from deckbot.models.deck import DeckInfo
+from deckbot.models.repo import APPROVED_REPOS
 from deckbot.models.sol import SolType, normalize_sol
+from deckbot.services.version_resolver import ResolveError, resolve_ref
 
 if TYPE_CHECKING:
   from deckbot.bot import DeckBot
@@ -571,6 +579,513 @@ class DecksCog(commands.Cog, name="Decks"):
       for t in _TAGS
       if current.lower() in t.lower()
     ]
+
+  # ── /deck run ─────────────────────────────────────────────────────────────
+
+  @deck.command(
+    name="run",
+    description="Queue a MYSTRAN run for a deck",
+  )
+  @app_commands.describe(
+    deck_id="Deck ID to run",
+    repo="Repository name (see /deck repos for the list)",
+    ref="Branch, tag, or full commit SHA",
+  )
+  async def run_cmd(
+    self,
+    interaction: discord.Interaction,
+    deck_id: int,
+    repo: str,
+    ref: str,
+  ) -> None:
+    await interaction.response.defer(thinking=True)
+
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      deck = await get_deck(session, deck_id)
+      if deck is None:
+        await interaction.followup.send(
+          f"No deck with ID `{deck_id}`.", ephemeral=True
+        )
+        return
+
+      if repo not in APPROVED_REPOS:
+        allowed = ", ".join(f"`{k}`" for k in APPROVED_REPOS)
+        await interaction.followup.send(
+          f"`{repo}` is not an approved repository. Allowed: {allowed}",
+          ephemeral=True,
+        )
+        return
+
+      try:
+        commit_hash = await resolve_ref(repo, ref)
+      except ResolveError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+
+      version = await get_or_create_version(
+        session,
+        repo,
+        commit_hash,
+        ref_name=ref if ref != commit_hash else None,
+      )
+      await session.flush()
+
+      active = await get_active_run_for_deck_version(
+        session, deck_id, version.id
+      )
+      if active is not None:
+        await interaction.followup.send(
+          f"Deck `#{deck_id}` already has a `{active.status}` run "
+          f"for `{repo}@{ref}` (run #{active.id}).",
+          ephemeral=ephemeral,
+        )
+        return
+
+      run = Run(
+        deck_id=deck_id,
+        version_id=version.id,
+        status="pending",
+        submitted_by=interaction.user.id,
+        created_at=datetime.now(UTC),
+      )
+      session.add(run)
+      await session.commit()
+      run_id = run.id
+
+    ref_display = ref if ref == commit_hash else f"{ref} ({commit_hash[:8]})"
+    await interaction.followup.send(
+      f"Run `#{run_id}` queued: deck `#{deck_id}` on `{repo}@{ref_display}`.",
+      ephemeral=ephemeral,
+    )
+
+  @run_cmd.autocomplete("repo")
+  async def _run_repo_autocomplete(
+    self,
+    interaction: discord.Interaction,
+    current: str,
+  ) -> list[app_commands.Choice[str]]:
+    return [
+      app_commands.Choice(name=k, value=k)
+      for k in APPROVED_REPOS
+      if current.lower() in k.lower()
+    ][:25]
+
+  # ── /deck run-bulk ────────────────────────────────────────────────────────
+
+  @deck.command(
+    name="run-bulk",
+    description="Queue MYSTRAN runs for all decks matching optional filters",
+  )
+  @app_commands.describe(
+    repo="Repository name",
+    ref="Branch, tag, or full commit SHA",
+    name="Filename substring filter",
+    sol='SOL type filter (use "other" for unrecognised)',
+    min_grids="Minimum GRID count",
+    max_grids="Maximum GRID count",
+    tag="Filter to decks with this tag",
+    channel="Filter to decks from this channel",
+  )
+  async def run_bulk_cmd(
+    self,
+    interaction: discord.Interaction,
+    repo: str,
+    ref: str,
+    name: str | None = None,
+    sol: str | None = None,
+    min_grids: int | None = None,
+    max_grids: int | None = None,
+    tag: str | None = None,
+    channel: discord.TextChannel | None = None,
+  ) -> None:
+    await interaction.response.defer(thinking=True)
+
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      if repo not in APPROVED_REPOS:
+        allowed = ", ".join(f"`{k}`" for k in APPROVED_REPOS)
+        await interaction.followup.send(
+          f"`{repo}` is not an approved repository. Allowed: {allowed}",
+          ephemeral=True,
+        )
+        return
+
+      sol_filter: SolType | None = None
+      if sol is not None:
+        if sol == "other":
+          sol_filter = SolType.unknown
+        else:
+          sol_filter = normalize_sol(sol)
+          if sol_filter is None or sol_filter == SolType.unknown:
+            await interaction.followup.send(
+              f"`{sol}` is not a recognised SOL type. "
+              'Use "other" to match unrecognised SOLs.',
+              ephemeral=True,
+            )
+            return
+
+      channel_id = channel.id if channel else None
+
+      # Resolve ref before doing anything else.
+      try:
+        commit_hash = await resolve_ref(repo, ref)
+      except ResolveError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+
+      version = await get_or_create_version(
+        session,
+        repo,
+        commit_hash,
+        ref_name=ref if ref != commit_hash else None,
+      )
+      await session.flush()
+
+      # Fetch all matching decks (no pagination — we want the full list).
+      from sqlalchemy import select as sa_select
+
+      from deckbot.db.models import Deck, DeckTag
+
+      query = sa_select(Deck.id)
+      if name is not None:
+        query = query.where(Deck.filename.ilike(f"%{name}%"))
+      if sol_filter is not None:
+        query = query.where(Deck.sol == sol_filter.value)
+      if min_grids is not None:
+        query = query.where(Deck.grid_count >= min_grids)
+      if max_grids is not None:
+        query = query.where(Deck.grid_count <= max_grids)
+      if tag is not None:
+        query = query.where(
+          Deck.id.in_(sa_select(DeckTag.deck_id).where(DeckTag.tag == tag))
+        )
+      if channel_id is not None:
+        query = query.where(Deck.source_channel_id == channel_id)
+
+      result = await session.execute(query)
+      all_deck_ids: list[int] = [row[0] for row in result]
+
+    total = len(all_deck_ids)
+    if total == 0:
+      await interaction.followup.send(
+        "No decks match those filters.", ephemeral=ephemeral
+      )
+      return
+
+    # Confirmation gate: if ≥50 decks, require the user to confirm via a button.
+    if total >= 50:
+      confirmed = await _confirm_bulk(interaction, total, repo, ref, ephemeral)
+      if not confirmed:
+        return
+
+    # Enqueue runs, skipping decks that already have a pending/running run.
+    queued = 0
+    skipped = 0
+    async with get_session() as session:
+      version = await get_or_create_version(
+        session,
+        repo,
+        commit_hash,
+        ref_name=ref if ref != commit_hash else None,
+      )
+      await session.flush()
+
+      for did in all_deck_ids:
+        active = await get_active_run_for_deck_version(
+          session, did, version.id
+        )
+        if active is not None:
+          skipped += 1
+          continue
+        session.add(
+          Run(
+            deck_id=did,
+            version_id=version.id,
+            status="pending",
+            submitted_by=interaction.user.id,
+            created_at=datetime.now(UTC),
+          )
+        )
+        queued += 1
+
+      await session.commit()
+
+    ref_display = ref if ref == commit_hash else f"{ref} ({commit_hash[:8]})"
+    parts = [f"Queued **{queued}** run(s) on `{repo}@{ref_display}`."]
+    if skipped:
+      parts.append(
+        f"{skipped} deck(s) already had a pending/running run and were skipped."
+      )
+    await interaction.followup.send(" ".join(parts), ephemeral=ephemeral)
+
+  @run_bulk_cmd.autocomplete("repo")
+  async def _run_bulk_repo_autocomplete(
+    self,
+    interaction: discord.Interaction,
+    current: str,
+  ) -> list[app_commands.Choice[str]]:
+    return [
+      app_commands.Choice(name=k, value=k)
+      for k in APPROVED_REPOS
+      if current.lower() in k.lower()
+    ][:25]
+
+  @run_bulk_cmd.autocomplete("sol")
+  async def _run_bulk_sol_autocomplete(
+    self,
+    interaction: discord.Interaction,
+    current: str,
+  ) -> list[app_commands.Choice[str]]:
+    choices = [
+      app_commands.Choice(name=v, value=v)
+      for v in [*[s.value for s in SolType if s != SolType.unknown], "other"]
+      if current.lower() in v.lower()
+    ]
+    return choices[:25]
+
+  @run_bulk_cmd.autocomplete("tag")
+  async def _run_bulk_tag_autocomplete(
+    self,
+    interaction: discord.Interaction,
+    current: str,
+  ) -> list[app_commands.Choice[str]]:
+    return [
+      app_commands.Choice(name=t, value=t)
+      for t in _TAGS
+      if current.lower() in t.lower()
+    ]
+
+  # ── /deck repos ───────────────────────────────────────────────────────────
+
+  @deck.command(
+    name="repos",
+    description="List approved MYSTRAN repositories for running decks",
+  )
+  async def repos_cmd(self, interaction: discord.Interaction) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+    lines = [f"`{name}` — <{url}>" for name, url in APPROVED_REPOS.items()]
+    embed = discord.Embed(
+      title="Approved MYSTRAN Repositories",
+      description="\n".join(lines) if lines else "_none_",
+      colour=discord.Colour.orange(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+  # ── /deck runs ────────────────────────────────────────────────────────────
+
+  @deck.command(
+    name="runs",
+    description="List MYSTRAN runs for a deck",
+  )
+  @app_commands.describe(
+    deck_id="Deck ID",
+    page="Page number (default: 1)",
+  )
+  async def runs_cmd(
+    self,
+    interaction: discord.Interaction,
+    deck_id: int,
+    page: int = 1,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      deck = await get_deck(session, deck_id)
+      if deck is None:
+        await interaction.response.send_message(
+          f"No deck with ID `{deck_id}`.", ephemeral=True
+        )
+        return
+
+      runs, total = await list_runs_for_deck(
+        session, deck_id, page=page, per_page=5
+      )
+
+    if not runs:
+      await interaction.response.send_message(
+        f"No runs recorded for deck `#{deck_id}` yet.", ephemeral=ephemeral
+      )
+      return
+
+    total_pages = max(1, math.ceil(total / 5))
+    embed = discord.Embed(
+      title=f"Runs for deck #{deck_id} — page {page}/{total_pages} (total: {total})",
+      colour=discord.Colour.orange(),
+    )
+    for run in runs:
+      _add_run_field(embed, run)
+
+    await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+  # ── /deck run-status ──────────────────────────────────────────────────────
+
+  @deck.command(
+    name="run-status",
+    description="Show details for a single MYSTRAN run",
+  )
+  @app_commands.describe(run_id="Run ID")
+  async def run_status_cmd(
+    self,
+    interaction: discord.Interaction,
+    run_id: int,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+      run = await get_run(session, run_id)
+
+    if run is None:
+      await interaction.response.send_message(
+        f"No run with ID `{run_id}`.", ephemeral=True
+      )
+      return
+
+    embed = discord.Embed(
+      title=f"Run #{run_id}",
+      colour=_run_colour(run.status),
+    )
+    embed.add_field(
+      name="Deck",
+      value=f"#{run.deck_id} `{run.deck.filename}`",
+      inline=True,
+    )
+    embed.add_field(
+      name="Version",
+      value=(
+        f"`{run.version.repo_name}@"
+        f"{run.version.ref_name or run.version.commit_hash[:8]}`"
+      ),
+      inline=True,
+    )
+    embed.add_field(
+      name="Status",
+      value=f"{_RUN_EMOJI.get(run.status, '❓')} `{run.status}`",
+      inline=True,
+    )
+    if run.node:
+      embed.add_field(name="Node", value=f"`{run.node.name}`", inline=True)
+    if run.exit_code is not None:
+      embed.add_field(
+        name="Exit code", value=f"`{run.exit_code}`", inline=True
+      )
+    embed.add_field(
+      name="Queued",
+      value=run.created_at.strftime("%Y-%m-%d %H:%M UTC"),
+      inline=True,
+    )
+    if run.started_at:
+      embed.add_field(
+        name="Started",
+        value=run.started_at.strftime("%Y-%m-%d %H:%M UTC"),
+        inline=True,
+      )
+    if run.completed_at:
+      embed.add_field(
+        name="Completed",
+        value=run.completed_at.strftime("%Y-%m-%d %H:%M UTC"),
+        inline=True,
+      )
+    if run.error:
+      short = run.error[:300]
+      if len(run.error) > 300:
+        short += "…"
+      embed.add_field(
+        name="Error / notes", value=f"```{short}```", inline=False
+      )
+
+    await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+
+# ── Run formatting helpers ────────────────────────────────────────────────────
+
+_RUN_EMOJI: dict[str, str] = {
+  "pending": "⏳",
+  "running": "🔄",
+  "completed": "✅",
+  "failed": "❌",
+  "cancelled": "🚫",
+}
+
+
+def _run_colour(status: str) -> discord.Colour:
+  return {
+    "completed": discord.Colour.green(),
+    "failed": discord.Colour.red(),
+    "running": discord.Colour.yellow(),
+    "cancelled": discord.Colour.greyple(),
+  }.get(status, discord.Colour.orange())
+
+
+def _add_run_field(embed: discord.Embed, run: Run) -> None:
+  emoji = _RUN_EMOJI.get(run.status, "❓")
+  ref = run.version.ref_name or run.version.commit_hash[:8]
+  name = f"#{run.id} {emoji} `{run.version.repo_name}@{ref}`"
+  parts = [f"status: `{run.status}`"]
+  if run.node:
+    parts.append(f"node: `{run.node.name}`")
+  if run.exit_code is not None:
+    parts.append(f"exit: `{run.exit_code}`")
+  parts.append(run.created_at.strftime("%Y-%m-%d %H:%M UTC"))
+  embed.add_field(name=name, value=" · ".join(parts), inline=False)
+
+
+# ── Bulk-run confirmation view ────────────────────────────────────────────────
+
+
+class _BulkConfirmView(discord.ui.View):
+  def __init__(self) -> None:
+    super().__init__(timeout=60.0)
+    self.confirmed: bool | None = None
+
+  @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+  async def confirm(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    self.confirmed = True
+    self.stop()
+    await interaction.response.defer()
+
+  @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+  async def cancel(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    self.confirmed = False
+    self.stop()
+    await interaction.response.defer()
+
+
+async def _confirm_bulk(
+  interaction: discord.Interaction,
+  total: int,
+  repo: str,
+  ref: str,
+  ephemeral: bool,
+) -> bool:
+  """Send a confirmation prompt and return True if the user confirms."""
+  view = _BulkConfirmView()
+  await interaction.followup.send(
+    f"This will queue **{total}** runs on `{repo}@{ref}`. Are you sure?",
+    view=view,
+    ephemeral=ephemeral,
+  )
+  await view.wait()
+  if view.confirmed:
+    return True
+  await interaction.followup.send("Cancelled.", ephemeral=ephemeral)
+  return False
 
 
 async def setup(bot: commands.Bot) -> None:
