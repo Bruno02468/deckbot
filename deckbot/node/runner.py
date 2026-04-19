@@ -108,9 +108,13 @@ async def _execute(
 
   # ── Determine finish classification ────────────────────────────────────
   # Check the F06 for a controlled MYSTRAN fatal before looking at exit code.
+  # If no F06 was produced, fall back to stdout: "FATAL" in stdout means a
+  # fatal that occurred before the F06 was written; otherwise it's a crash.
   f06_files = list(work_dir.glob("*.f06")) + list(work_dir.glob("*.F06"))
   finish: str
   if f06_files and "FATAL MESSAGE" in f06_files[0].read_text(errors="replace"):
+    finish = "fatal"
+  elif not f06_files and "FATAL" in stdout_bytes.decode(errors="replace"):
     finish = "fatal"
   elif exit_code != 0:
     finish = "crash"
