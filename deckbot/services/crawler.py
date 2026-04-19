@@ -64,8 +64,9 @@ async def _crawl_all_threads(
 
   # Active threads (guild-wide, filtered to this channel).
   try:
-    active = await channel.guild.fetch_active_threads()
-    threads.extend(t for t in active.threads if t.parent_id == channel.id)
+    threads.extend(
+      t for t in channel.guild.active_threads() if t.parent_id == channel.id
+    )
   except discord.Forbidden:
     log.warning(
       "No permission to fetch active threads in channel %d", channel.id
