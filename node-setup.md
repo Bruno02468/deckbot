@@ -62,6 +62,11 @@ Check that it runs with `systemctl --user status deckbot-node`.
 
 You can see the real-time logs of the node with `journalctl --user -u deckbot-node -f`.
 
+
+## 4. In case of updates...
+
+You might get warned about node updates by Bruno or some other admin. If that happens, all you need to do is update your local copy with `git pull` and then restart the node daemon with `systemctl --user restart deckbot-node`.
+
 ## Done!
 
 There, now you're contributing compute power for MYSTRAN tests and runs coordinated via DeckBot in the MYSTRAN Discord server.
