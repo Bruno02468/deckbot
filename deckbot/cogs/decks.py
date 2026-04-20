@@ -64,6 +64,7 @@ _TAGS: list[str] = [
   "bad_result",
   "slow",
   "big",
+  "memcheck_set",
 ]
 
 # Buttons become non-interactive after this many seconds of no use.
