@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import math
 import zipfile
@@ -17,18 +18,26 @@ from discord.ext import commands
 
 from deckbot.cogs._checks import _is_deckbot_admin, admin_check as _admin_check
 from deckbot.config import get_settings
-from deckbot.db.models import Deck, Run
+from deckbot.db.models import Deck, Run, RunBatch
 from deckbot.db.queries import (
   DECKS_PER_PAGE,
+  BatchSummary,
   add_tag,
+  cancel_batch_runs,
+  create_batch,
   fetch_deck_blobs,
+  get_active_run_for_deck_version,
   get_any_run_for_deck_version,
+  get_batch,
+  get_batch_summary,
   get_deck,
   get_deckbot_channel_id,
   get_decks_by_hashes,
   get_decks_by_message,
   get_or_create_version,
   get_run,
+  list_recent_batches,
+  list_runs_for_batch,
   list_runs_for_deck,
   remove_tag,
   search_decks,
@@ -87,6 +96,7 @@ def _build_zip(blobs: list[tuple[int, str, bytes]]) -> io.BytesIO:
 
 
 _VIEW_TIMEOUT = 120.0
+RUNS_PER_BATCH_PAGE = 10
 
 
 class RunDeckModal(discord.ui.Modal, title="Run deck with MYSTRAN"):
@@ -825,6 +835,7 @@ class DecksCog(commands.Cog, name="Decks"):
   )
   @app_commands.describe(
     ref="Branch, tag, or full commit SHA",
+    label="Optional label for this batch (e.g. 'testing main')",
     name="Filename substring filter",
     sol='SOL type filter (use "other" for unrecognised)',
     min_grids="Minimum GRID count",
@@ -836,6 +847,7 @@ class DecksCog(commands.Cog, name="Decks"):
     self,
     interaction: discord.Interaction,
     ref: str,
+    label: str | None = None,
     name: str | None = None,
     sol: str | None = None,
     min_grids: int | None = None,
@@ -918,7 +930,24 @@ class DecksCog(commands.Cog, name="Decks"):
       if not confirmed:
         return
 
-    # Enqueue runs, skipping decks that already have a pending/running run.
+    # Build a human-readable filter summary for the batch record.
+    filter_parts: dict[str, str] = {}
+    if name:
+      filter_parts["name"] = name
+    if sol_filter:
+      filter_parts["sol"] = sol_filter.value
+    if min_grids is not None:
+      filter_parts["min_grids"] = str(min_grids)
+    if max_grids is not None:
+      filter_parts["max_grids"] = str(max_grids)
+    if tag:
+      filter_parts["tag"] = tag
+    if channel_id:
+      filter_parts["channel"] = f"<#{channel_id}>"
+    filter_summary = json.dumps(filter_parts) if filter_parts else None
+
+    # Enqueue runs.  Skip only decks with an active (pending/building/running)
+    # run for this version; completed/failed runs are re-queued.
     queued = 0
     skipped = 0
     async with get_session() as session:
@@ -930,8 +959,18 @@ class DecksCog(commands.Cog, name="Decks"):
       )
       await session.flush()
 
+      batch = await create_batch(
+        session,
+        version_id=version.id,
+        submitted_by=interaction.user.id,
+        label=label,
+        filter_summary=filter_summary,
+      )
+
       for did in all_deck_ids:
-        existing = await get_any_run_for_deck_version(session, did, version.id)
+        existing = await get_active_run_for_deck_version(
+          session, did, version.id
+        )
         if existing is not None:
           skipped += 1
           continue
@@ -939,6 +978,7 @@ class DecksCog(commands.Cog, name="Decks"):
           Run(
             deck_id=did,
             version_id=version.id,
+            batch_id=batch.id,
             status="pending",
             submitted_by=interaction.user.id,
             created_at=datetime.now(UTC),
@@ -947,12 +987,34 @@ class DecksCog(commands.Cog, name="Decks"):
         queued += 1
 
       await session.commit()
+      batch_id = batch.id
 
-    ref_display = ref if ref == commit_hash else f"{ref} ({commit_hash[:8]})"
-    parts = [f"Queued **{queued}** run(s) on `{repo}@{ref_display}`."]
+    # Re-fetch batch + summary for the initial embed.
+    api_public_url = get_settings().api_public_url
+    async with get_session() as session:
+      batch = await get_batch(session, batch_id)
+      assert batch is not None
+      summary = await get_batch_summary(session, batch_id)
+
+    total_run_pages = max(1, math.ceil(summary.total / RUNS_PER_BATCH_PAGE))
+    embed = _build_batch_summary_embed(batch, summary)
+    view = BatchView(
+      batch_id,
+      api_public_url,
+      ephemeral,
+      page=0,
+      total_run_pages=total_run_pages,
+    )
     if skipped:
-      parts.append(f"{skipped} deck(s) already had a run and were skipped.")
-    await interaction.followup.send(" ".join(parts), ephemeral=ephemeral)
+      embed.set_footer(
+        text=f"{skipped} deck(s) with active runs were skipped."
+      )
+    msg = await interaction.followup.send(
+      embed=embed, view=view, ephemeral=ephemeral, wait=True
+    )
+    asyncio.get_event_loop().create_task(
+      _auto_update_batch(msg, batch_id, api_public_url, ephemeral)
+    )
 
   @run_bulk_cmd.autocomplete("sol")
   async def _run_bulk_sol_autocomplete(
@@ -1076,6 +1138,54 @@ class DecksCog(commands.Cog, name="Decks"):
       embed=embed, view=view, ephemeral=ephemeral
     )
 
+  # ── /deck batches ─────────────────────────────────────────────────────────
+
+  @deck.command(
+    name="batches",
+    description="List recent run batches (5 per page)",
+  )
+  @app_commands.describe(page="Page number (default: 1)")
+  async def batches_cmd(
+    self,
+    interaction: discord.Interaction,
+    page: int = 1,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+      batches, total = await list_recent_batches(session, page=page)
+
+    if not batches:
+      await interaction.response.send_message(
+        "No batches recorded yet.", ephemeral=ephemeral
+      )
+      return
+
+    total_pages = max(1, math.ceil(total / 5))
+    embed = discord.Embed(
+      title=f"Run batches — page {page}/{total_pages} (total: {total})",
+      colour=discord.Colour.blurple(),
+    )
+    api_public_url = get_settings().api_public_url
+    for batch in batches:
+      ref = batch.version.ref_name or batch.version.commit_hash[:8]
+      version_str = f"`{batch.version.repo_name}@{ref}`"
+      label_str = f" — {batch.label}" if batch.label else ""
+      created_str = batch.created_at.replace(tzinfo=UTC).strftime(
+        "%Y-%m-%d %H:%M UTC"
+      )
+      embed.add_field(
+        name=f"Batch #{batch.id}{label_str}",
+        value=(f"{version_str} · <@{batch.submitted_by}> · {created_str}"),
+        inline=False,
+      )
+    embed.set_footer(text="Use the buttons below to view a batch's details.")
+
+    view = _BatchListView(batches, api_public_url, ephemeral)
+    await interaction.response.send_message(
+      embed=embed, view=view, ephemeral=ephemeral
+    )
+
   # ── Context menu: "Run this deck" ─────────────────────────────────────────
 
   async def _ctx_run_deck(
@@ -1176,6 +1286,7 @@ class _DeckSelectView(discord.ui.View):
 
 _RUN_EMOJI: dict[str, str] = {
   "pending": "⏳",
+  "building": "🔨",
   "running": "🔄",
   "completed": "✅",
   "failed": "❌",
@@ -1187,6 +1298,7 @@ def _run_colour(status: str) -> discord.Colour:
   return {
     "completed": discord.Colour.green(),
     "failed": discord.Colour.red(),
+    "building": discord.Colour.blue(),
     "running": discord.Colour.yellow(),
     "cancelled": discord.Colour.greyple(),
   }.get(status, discord.Colour.orange())
@@ -1247,18 +1359,40 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
     embed.add_field(
       name="Waiting", value=_fmt_elapsed(now - created), inline=True
     )
-  elif run.status == "running" and run.started_at:
-    started = run.started_at.replace(tzinfo=UTC)
+  elif run.status == "building" and run.started_at:
+    build_started = run.started_at.replace(tzinfo=UTC)
     embed.add_field(
-      name="Started",
-      value=started.strftime("%Y-%m-%d %H:%M UTC"),
+      name="Build started",
+      value=build_started.strftime("%Y-%m-%d %H:%M UTC"),
       inline=True,
     )
     embed.add_field(
-      name="Running for",
-      value=_fmt_elapsed(now - started),
+      name="Building for",
+      value=_fmt_elapsed(now - build_started),
       inline=True,
     )
+  elif run.status == "running":
+    run_started = (
+      run.run_started_at.replace(tzinfo=UTC)
+      if run.run_started_at
+      else run.started_at.replace(tzinfo=UTC)
+      if run.started_at
+      else None
+    )
+    if run_started:
+      embed.add_field(
+        name="Started",
+        value=run_started.strftime("%Y-%m-%d %H:%M UTC"),
+        inline=True,
+      )
+      embed.add_field(
+        name="Running for",
+        value=_fmt_elapsed(now - run_started),
+        inline=True,
+      )
+    else:
+      embed.add_field(name="Completed", value="—", inline=True)
+      embed.add_field(name="Elapsed", value="—", inline=True)
   elif run.completed_at:
     embed.add_field(
       name="Completed",
@@ -1267,11 +1401,15 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
       ),
       inline=True,
     )
-    if run.started_at:
-      elapsed = _fmt_elapsed(
-        run.completed_at.replace(tzinfo=UTC)
-        - run.started_at.replace(tzinfo=UTC)
-      )
+    exec_start = (
+      run.run_started_at.replace(tzinfo=UTC)
+      if run.run_started_at
+      else run.started_at.replace(tzinfo=UTC)
+      if run.started_at
+      else None
+    )
+    if exec_start:
+      elapsed = _fmt_elapsed(run.completed_at.replace(tzinfo=UTC) - exec_start)
       embed.add_field(name="Elapsed", value=elapsed, inline=True)
     else:
       embed.add_field(name="Elapsed", value="—", inline=True)
@@ -1351,9 +1489,19 @@ def _add_run_field(embed: discord.Embed, run: Run) -> None:
   created = run.created_at.replace(tzinfo=UTC)
   if run.status == "pending":
     parts.append(f"waiting {_fmt_elapsed(now - created)}")
-  elif run.status == "running" and run.started_at:
-    started = run.started_at.replace(tzinfo=UTC)
-    parts.append(f"running {_fmt_elapsed(now - started)}")
+  elif run.status == "building" and run.started_at:
+    build_started = run.started_at.replace(tzinfo=UTC)
+    parts.append(f"building {_fmt_elapsed(now - build_started)}")
+  elif run.status == "running":
+    run_started = (
+      run.run_started_at.replace(tzinfo=UTC)
+      if run.run_started_at
+      else run.started_at.replace(tzinfo=UTC)
+      if run.started_at
+      else None
+    )
+    if run_started:
+      parts.append(f"running {_fmt_elapsed(now - run_started)}")
   elif run.completed_at and run.started_at:
     elapsed = _fmt_elapsed(
       run.completed_at.replace(tzinfo=UTC) - run.started_at.replace(tzinfo=UTC)
@@ -1483,6 +1631,447 @@ async def _auto_update_run(
 
 
 # ── Bulk-run confirmation view ────────────────────────────────────────────────
+
+
+# ── Batch embed builders ─────────────────────────────────────────────────────────────
+
+_FINISH_EMOJI: dict[str, str] = {"normal": "✅", "fatal": "⚠️", "crash": "💥"}
+
+
+def _batch_colour(summary: BatchSummary) -> discord.Colour:
+  active = sum(
+    summary.by_status.get(s, 0) for s in ("pending", "building", "running")
+  )
+  if active > 0:
+    return discord.Colour.orange()
+  if summary.by_status.get("failed", 0) > 0 or summary.infra_errors > 0:
+    return discord.Colour.red()
+  return discord.Colour.green()
+
+
+def _build_batch_summary_embed(
+  batch: RunBatch,
+  summary: BatchSummary,
+) -> discord.Embed:
+  label_suffix = f" — {batch.label}" if batch.label else ""
+  embed = discord.Embed(
+    title=f"Batch #{batch.id}{label_suffix}",
+    colour=_batch_colour(summary),
+  )
+  ref = batch.version.ref_name or batch.version.commit_hash[:8]
+  version_value = f"`{batch.version.repo_name}@{ref}`"
+  if batch.version.ref_name:
+    version_value += f"\n`{batch.version.commit_hash[:8]}`"
+  embed.add_field(name="Version", value=version_value, inline=True)
+  embed.add_field(
+    name="Submitted by", value=f"<@{batch.submitted_by}>", inline=True
+  )
+  embed.add_field(
+    name="Created",
+    value=batch.created_at.replace(tzinfo=UTC).strftime("%Y-%m-%d %H:%M UTC"),
+    inline=True,
+  )
+  if batch.filter_summary:
+    try:
+      filters: dict[str, Any] = json.loads(batch.filter_summary)
+      parts = [f"`{k}`: {v}" for k, v in filters.items() if v is not None]
+      if parts:
+        embed.add_field(name="Filters", value=" · ".join(parts), inline=False)
+    except (ValueError, TypeError):
+      pass
+  status_order = [
+    "pending",
+    "building",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+  ]
+  status_parts = [
+    f"{_RUN_EMOJI.get(s, '')} {s}: **{n}**"
+    for s in status_order
+    if (n := summary.by_status.get(s, 0))
+  ]
+  embed.add_field(
+    name=f"Runs ({summary.total} total)",
+    value=" · ".join(status_parts) if status_parts else "—",
+    inline=False,
+  )
+  completed = summary.by_status.get("completed", 0)
+  if completed:
+    finish_parts = [
+      f"{emoji} {fv}: **{n}**"
+      for fv, emoji in _FINISH_EMOJI.items()
+      if (n := summary.by_finish.get(fv, 0))
+    ]
+    if summary.by_finish.get("unknown", 0):
+      finish_parts.append(f"❓ unknown: **{summary.by_finish['unknown']}**")
+    embed.add_field(
+      name="Finish",
+      value=" · ".join(finish_parts) if finish_parts else "—",
+      inline=True,
+    )
+    vg_parts: list[str] = []
+    if summary.valgrind_clean:
+      vg_parts.append(f"🧹 clean: **{summary.valgrind_clean}**")
+    if summary.valgrind_errors_found:
+      vg_parts.append(f"🐛 errors: **{summary.valgrind_errors_found}**")
+    if summary.valgrind_no_data:
+      vg_parts.append(f"— no data: **{summary.valgrind_no_data}**")
+    embed.add_field(
+      name="Valgrind",
+      value=" · ".join(vg_parts) if vg_parts else "—",
+      inline=True,
+    )
+  if summary.infra_errors:
+    embed.add_field(
+      name="⚠️ Infrastructure errors",
+      value=f"{summary.infra_errors} run(s) had node/system errors",
+      inline=False,
+    )
+  return embed
+
+
+def _build_batch_runs_embed(
+  batch: RunBatch,
+  runs: list[Run],
+  page: int,
+  total_pages: int,
+) -> discord.Embed:
+  label_suffix = f" — {batch.label}" if batch.label else ""
+  embed = discord.Embed(
+    title=(
+      f"Batch #{batch.id}{label_suffix} — Runs (page {page}/{total_pages})"
+    ),
+    colour=discord.Colour.orange(),
+  )
+  for run in runs:
+    _add_run_field(embed, run)
+  return embed
+
+
+# ── Batch views ────────────────────────────────────────────────────────────────────
+
+
+class _RunSelect(discord.ui.Select):
+  """Dropdown to view a single run's detail from a batch run-list page."""
+
+  def __init__(
+    self,
+    runs: list[Run],
+    api_public_url: str | None,
+  ) -> None:
+    self._api_public_url = api_public_url
+    options = [
+      discord.SelectOption(
+        label=f"#{r.id} {r.deck.filename[:80]}",
+        value=str(r.id),
+        description=(
+          f"{_RUN_EMOJI.get(r.status, '?')} {r.status}"
+          + (f" · {r.finish}" if getattr(r, "finish", None) else "")
+        ),
+      )
+      for r in runs
+    ]
+    super().__init__(
+      placeholder="View a run's details…",
+      options=options,
+      row=1,
+    )
+
+  async def callback(self, interaction: discord.Interaction) -> None:
+    run_id = int(self.values[0])
+    async with get_session() as session:
+      run = await get_run(session, run_id)
+    if run is None:
+      await interaction.response.send_message("Run not found.", ephemeral=True)
+      return
+    embed = _build_run_embed(run, self._api_public_url)
+    done = run.status in _TERMINAL_STATUSES
+    view = None if done else RunStatusView(run_id, self._api_public_url)
+    await interaction.response.send_message(
+      embed=embed, view=view, ephemeral=True
+    )
+
+
+class BatchView(discord.ui.View):
+  """Batch summary (page=0) or paginated run list (page≥1).
+
+  Page 0 buttons: 🔄 Refresh | View Runs ► | ❌ Cancel Batch
+  Page ≥1 buttons: ◄ Summary | ◄ Prev | Next ► | 🔄 Refresh
+  Page ≥1 also has a run-select dropdown (row 1).
+  """
+
+  def __init__(
+    self,
+    batch_id: int,
+    api_public_url: str | None,
+    ephemeral: bool,
+    page: int = 0,
+    total_run_pages: int = 1,
+  ) -> None:
+    super().__init__(timeout=None)
+    self._batch_id = batch_id
+    self._api_public_url = api_public_url
+    self._ephemeral = ephemeral
+    self._page = page
+    self._total_run_pages = total_run_pages
+    if page == 0:
+      self.remove_item(self.btn_summary)
+      self.remove_item(self.btn_prev)
+      self.remove_item(self.btn_next)
+      self.remove_item(self.btn_refresh_runs)
+    else:
+      self.remove_item(self.btn_view_runs)
+      self.remove_item(self.btn_cancel)
+      self.remove_item(self.btn_refresh_summary)
+      self.btn_prev.disabled = page <= 1
+      self.btn_next.disabled = page >= total_run_pages
+
+  async def _go_to_page(
+    self, interaction: discord.Interaction, new_page: int
+  ) -> None:
+    async with get_session() as session:
+      batch = await get_batch(session, self._batch_id)
+      if batch is None:
+        await interaction.response.send_message(
+          "Batch not found.", ephemeral=True
+        )
+        return
+      if new_page == 0:
+        summary = await get_batch_summary(session, self._batch_id)
+        total_run_pages = max(
+          1, math.ceil(summary.total / RUNS_PER_BATCH_PAGE)
+        )
+        embed = _build_batch_summary_embed(batch, summary)
+        new_view: BatchView = BatchView(
+          self._batch_id,
+          self._api_public_url,
+          self._ephemeral,
+          page=0,
+          total_run_pages=total_run_pages,
+        )
+      else:
+        runs, total = await list_runs_for_batch(
+          session, self._batch_id, page=new_page
+        )
+        total_run_pages = max(1, math.ceil(total / RUNS_PER_BATCH_PAGE))
+        embed = _build_batch_runs_embed(batch, runs, new_page, total_run_pages)
+        new_view = BatchView(
+          self._batch_id,
+          self._api_public_url,
+          self._ephemeral,
+          page=new_page,
+          total_run_pages=total_run_pages,
+        )
+        if runs:
+          new_view.add_item(_RunSelect(runs, self._api_public_url))
+    await interaction.response.edit_message(embed=embed, view=new_view)
+
+  @discord.ui.button(
+    label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=0
+  )
+  async def btn_refresh_summary(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to_page(interaction, 0)
+
+  @discord.ui.button(
+    label="View Runs ►", style=discord.ButtonStyle.primary, row=0
+  )
+  async def btn_view_runs(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to_page(interaction, 1)
+
+  @discord.ui.button(
+    label="❌ Cancel Batch", style=discord.ButtonStyle.danger, row=0
+  )
+  async def btn_cancel(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    confirm_view = _BatchCancelConfirmView(self._batch_id)
+    await interaction.response.send_message(
+      f"Cancel all pending/building runs in batch #{self._batch_id}?",
+      view=confirm_view,
+      ephemeral=True,
+    )
+
+  @discord.ui.button(
+    label="◄ Summary", style=discord.ButtonStyle.secondary, row=0
+  )
+  async def btn_summary(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to_page(interaction, 0)
+
+  @discord.ui.button(
+    label="◄ Prev", style=discord.ButtonStyle.secondary, row=0
+  )
+  async def btn_prev(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to_page(interaction, self._page - 1)
+
+  @discord.ui.button(
+    label="Next ►", style=discord.ButtonStyle.secondary, row=0
+  )
+  async def btn_next(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to_page(interaction, self._page + 1)
+
+  @discord.ui.button(
+    label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=0
+  )
+  async def btn_refresh_runs(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to_page(interaction, self._page)
+
+
+class _BatchCancelConfirmView(discord.ui.View):
+  """Ephemeral confirmation before cancelling all active runs in a batch."""
+
+  def __init__(self, batch_id: int) -> None:
+    super().__init__(timeout=60.0)
+    self._batch_id = batch_id
+
+  @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
+  async def confirm(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    button.disabled = True
+    await interaction.response.defer()
+    async with get_session() as session:
+      count = await cancel_batch_runs(session, self._batch_id)
+      await session.commit()
+    self.stop()
+    await interaction.edit_original_response(
+      content=f"Cancelled **{count}** run(s) in batch #{self._batch_id}.",
+      view=None,
+    )
+
+  @discord.ui.button(label="Abort", style=discord.ButtonStyle.secondary)
+  async def abort(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    self.stop()
+    await interaction.response.edit_message(
+      content="Cancellation aborted.", view=None
+    )
+
+
+async def _auto_update_batch(
+  message: discord.Message,
+  batch_id: int,
+  api_public_url: str | None,
+  ephemeral: bool,
+) -> None:
+  """Background task: keep the batch summary message up-to-date.
+
+  Polls every 30 s for up to 30 minutes, stopping early when all runs
+  reach a terminal state.  Always renders page 0 (summary).
+  """
+  for _ in range(60):  # 60 × 30 s = 30 min max
+    await asyncio.sleep(30)
+    try:
+      async with get_session() as session:
+        batch = await get_batch(session, batch_id)
+        if batch is None:
+          break
+        summary = await get_batch_summary(session, batch_id)
+      active = sum(
+        summary.by_status.get(s, 0) for s in ("pending", "building", "running")
+      )
+      total_run_pages = max(1, math.ceil(summary.total / RUNS_PER_BATCH_PAGE))
+      embed = _build_batch_summary_embed(batch, summary)
+      view = BatchView(
+        batch_id,
+        api_public_url,
+        ephemeral,
+        page=0,
+        total_run_pages=total_run_pages,
+      )
+      await message.edit(embed=embed, view=view)
+      if active == 0:
+        break
+    except (discord.HTTPException, asyncio.CancelledError):
+      break
+
+
+# ── Batch list view ──────────────────────────────────────────────────────────
+
+
+class _BatchListView(discord.ui.View):
+  """One 'View →' button per batch row returned by /deck batches."""
+
+  def __init__(
+    self,
+    batches: list[RunBatch],
+    api_public_url: str | None,
+    ephemeral: bool,
+  ) -> None:
+    super().__init__(timeout=_VIEW_TIMEOUT)
+    for batch in batches[:5]:
+      label_suffix = f" — {batch.label[:30]}" if batch.label else ""
+      btn: discord.ui.Button[Any] = discord.ui.Button(
+        label=f"#{batch.id}{label_suffix}",
+        style=discord.ButtonStyle.primary,
+      )
+      btn.callback = _make_batch_btn_cb(batch.id, api_public_url, ephemeral)
+      self.add_item(btn)
+
+
+def _make_batch_btn_cb(
+  batch_id: int,
+  api_public_url: str | None,
+  ephemeral: bool,
+) -> Any:
+  async def cb(interaction: discord.Interaction) -> None:
+    async with get_session() as session:
+      batch = await get_batch(session, batch_id)
+      if batch is None:
+        await interaction.response.send_message(
+          "Batch not found.", ephemeral=True
+        )
+        return
+      summary = await get_batch_summary(session, batch_id)
+    total_run_pages = max(1, math.ceil(summary.total / RUNS_PER_BATCH_PAGE))
+    embed = _build_batch_summary_embed(batch, summary)
+    view = BatchView(
+      batch_id,
+      api_public_url,
+      ephemeral,
+      page=0,
+      total_run_pages=total_run_pages,
+    )
+    await interaction.response.send_message(
+      embed=embed, view=view, ephemeral=True
+    )
+
+  return cb
+
+
+# ── Bulk-run confirmation view ───────────────────────────────────────────────────────
 
 
 class _BulkConfirmView(discord.ui.View):

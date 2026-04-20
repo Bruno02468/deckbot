@@ -79,6 +79,18 @@ async def _execute(
     job.repo_name, job.repo_url, job.commit_hash, config
   )
 
+  # ── Notify API that build is done and execution is starting ────────────
+  try:
+    resp = await client.post(f"/api/v1/jobs/{job.run_id}/start")
+    resp.raise_for_status()
+    log.info("Run #%d: transitioned to running", job.run_id)
+  except Exception as exc:
+    log.warning(
+      "Run #%d: failed to call /start (continuing anyway): %s",
+      job.run_id,
+      exc,
+    )
+
   # ── Run under valgrind ──────────────────────────────────────────────────
   valgrind_xml = work_dir / "valgrind.xml"
   cmd = build_command(binary, deck_path, valgrind_xml)

@@ -108,6 +108,31 @@ async def get_next_jobs(
   return items
 
 
+@router.post("/jobs/{run_id}/start", status_code=204)
+async def start_job(
+  run_id: int,
+  node: Node = Depends(require_active_node),
+  session: AsyncSession = Depends(get_db_session),
+) -> None:
+  """Transition a run from ``building`` to ``running``.
+
+  Called by the node once the MYSTRAN binary is ready and deck execution
+  is about to begin.  Sets ``run_started_at`` to the current time.
+  """
+  run = _get_run_or_404(await get_run(session, run_id), run_id)
+  _assert_run_owned_by_node(run, node)
+
+  if run.status != "building":
+    raise HTTPException(
+      status_code=409,
+      detail=f"Run {run_id} is not in 'building' state (got '{run.status}')",
+    )
+
+  run.status = "running"
+  run.run_started_at = datetime.now(UTC)
+  await session.commit()
+
+
 @router.post("/jobs/{run_id}/complete", status_code=204)
 async def complete_job(
   run_id: int,
@@ -124,10 +149,13 @@ async def complete_job(
   run = _get_run_or_404(await get_run(session, run_id), run_id)
   _assert_run_owned_by_node(run, node)
 
-  if run.status != "running":
+  if run.status not in ("building", "running"):
     raise HTTPException(
       status_code=409,
-      detail=f"Run {run_id} is not in 'running' state (got '{run.status}')",
+      detail=(
+        f"Run {run_id} is not in 'building' or 'running' state"
+        f" (got '{run.status}')"
+      ),
     )
 
   try:
@@ -183,10 +211,13 @@ async def fail_job(
   run = _get_run_or_404(await get_run(session, run_id), run_id)
   _assert_run_owned_by_node(run, node)
 
-  if run.status != "running":
+  if run.status not in ("building", "running"):
     raise HTTPException(
       status_code=409,
-      detail=f"Run {run_id} is not in 'running' state (got '{run.status}')",
+      detail=(
+        f"Run {run_id} is not in 'building' or 'running' state"
+        f" (got '{run.status}')"
+      ),
     )
 
   run.status = "failed"

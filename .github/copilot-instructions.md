@@ -38,7 +38,7 @@ deckbot/
   bot.py           — DeckBot(commands.Bot): loads cogs, starts JobRunner, tracks channel IDs
   db/
     models.py      — SQLAlchemy ORM: Setting, Channel, Job, ProcessedMessage, Deck, DeckTag,
-                     MystranVersion, Node, Run, RunFile
+                     MystranVersion, Node, Run, RunBatch, RunFile
     session.py     — async engine factory, get_session() context manager, enable_wal()
     queries.py     — async query helpers (list_decks, count_jobs_by_status, etc.)
   cogs/
@@ -47,7 +47,7 @@ deckbot/
     admin.py       — /deckbot group (admin-only): setup, track, untrack, channels, crawl,
                      reprocess, status, jobs, node-create, node-list, node-remove
     decks.py       — /deck group: list, search, tag, untag, run, run-bulk, repos, runs,
-                     run-status
+                     run-status, batches
   services/
     deck_parser.py — parse_deck() → DeckProperties (SolType | None, grid_count); hash_deck(); compress_deck()
     zip_handler.py — extract_decks(): recursive ZIP extraction, depth ≤ 3, ≤ 50 MB total
@@ -68,8 +68,8 @@ deckbot/
     deps.py        — get_db_session dependency
     routers/
       nodes.py     — POST /api/v1/keepalive: updates last_seen_at + max_threads, returns 204
-      jobs.py      — GET /api/v1/jobs/next?slots=N; POST /api/v1/jobs/{id}/complete (multipart);
-                     POST /api/v1/jobs/{id}/fail
+      jobs.py      — GET /api/v1/jobs/next?slots=N; POST /api/v1/jobs/{id}/start;
+                     POST /api/v1/jobs/{id}/complete (multipart); POST /api/v1/jobs/{id}/fail
   node/
     config.py      — NodeSettings (pydantic-settings, NODE_ prefix): api_endpoint, api_key,
                      max_threads, build_cache_dir, work_base_dir, poll_interval, keepalive_interval
@@ -77,7 +77,8 @@ deckbot/
     sandbox.py     — build_command(): firejail --net=none + valgrind memcheck argv list
     runner.py      — run_job(): write deck → get binary → sandbox → collect outputs → multipart upload
     client.py      — NodeClient: asyncio keepalive loop + job poll loop
-migrations/        — Alembic versions: 0001_initial_schema, 0002_runs_schema
+migrations/        — Alembic versions: 0001_initial_schema, 0002_runs_schema, 0003_run_finish,
+                     0004_run_batches
 alembic.ini
 deckbot.service    — systemd unit for the bot (VPS)
 deckbot-api.service — systemd unit for the API server (VPS)
@@ -95,7 +96,8 @@ deckbot-node.service — systemd unit template for volunteer compute nodes
 - **deck_tags** `(deck_id, tag PK, tagged_by, tagged_at)` — predefined tags: `should_fatal`, `incompatible`, `bad_result`, `slow`, `big`
 - **mystran_versions** `(id, repo_name, commit_hash, ref_name, UNIQUE(repo_name, commit_hash))` — resolved MYSTRAN versions
 - **nodes** `(id, name UNIQUE, api_key_hash, last_seen_at, max_threads, is_active)` — registered compute nodes; `api_key_hash` is SHA-256 of the raw key
-- **runs** `(id, deck_id FK, version_id FK, node_id FK, status, submitted_by, created_at, started_at, completed_at, exit_code, error)` — run queue; statuses: `pending / running / completed / failed / cancelled`
+- **runs** `(id, deck_id FK, version_id FK, batch_id FK, node_id FK, status, submitted_by, created_at, started_at, run_started_at, completed_at, exit_code, error)` — run queue; statuses: `pending / building / running / completed / failed / cancelled`; `started_at` = node claimed run (build start); `run_started_at` = binary ready, execution start
+- **run_batches** `(id, version_id FK, submitted_by, label, filter_summary JSON, created_at)` — groups runs created by `/deck run-bulk`; `label` is optional free-text; `filter_summary` records the filters used
 - **run_files** `(id, run_id FK, filename, content BLOB, size_bytes, stored_at)` — zstd-compressed output files from a completed run
 
 ## Core behaviours to know
@@ -110,7 +112,9 @@ deckbot-node.service — systemd unit template for volunteer compute nodes
 - **SOL normalization**: raw SOL strings are mapped to a canonical `SolType` via a lookup table in `models/sol.py`. `NULL` = no SOL line; `"unknown"` = SOL found but not in the table. Run `/deckbot reprocess <channel>` after any change to the lookup table.
 - **JobRunner job types**: `crawl_channel` and `reprocess_channel`.
 - All datetimes are UTC-aware (`datetime.now(UTC)`). SQLite returns naive datetimes; apply `.replace(tzinfo=UTC)` before arithmetic.
-- **Run submission**: manual only (no auto-run on crawl). `/deck run` submits a single deck; `/deck run-bulk` submits all decks matching a search query (requires confirmation if ≥ 50 decks).
+- **Run submission**: manual only (no auto-run on crawl). `/deck run` submits a single deck; `/deck run-bulk` submits all decks matching a search query (requires confirmation if ≥ 50 decks), groups them into a `RunBatch`, and posts a live-updating `BatchView` embed. `/deck batches` lists recent batches (5/page) with buttons to open a batch's summary.
+- **Run status flow**: `pending → building` (node claims run) `→ running` (node calls `/start` after binary is ready) `→ completed / failed`. `cancelled` is set by the user via the batch cancel button. Runs with an active status (`pending / building / running`) are skipped when re-submitting the same deck+version.
+- **Batch summary embed** (`BatchView` page 0): total runs, per-status counts, finish-type breakdown (normal/fatal/crash), valgrind clean/errors/no-data counts, infrastructure error count. Page ≥ 1 shows a paginated run list (10/page) with a per-run dropdown for detail. The embed auto-updates every 30 s (up to 30 min) via a background task.
 - **Approved repos**: static dict in `models/repo.py`. Currently: `{"mystran": "https://github.com/MYSTRANsolver/MYSTRAN.git"}`. Version refs are resolved to full SHA-1 via `git ls-remote`.
 - **Node API auth**: `X-API-Key` header; key is SHA-256-hashed before storage. Key is shown exactly once at node creation (`/deckbot node-create`).
 - **Binary cache**: nodes cache built binaries at `{build_cache_dir}/binaries/{repo_name}/{commit_hash}/mystran`. Build uses CMake `Debug` mode. Shared repo clone lives at `{build_cache_dir}/repos/{repo_name}/`. One asyncio.Lock per repo prevents concurrent builds.

@@ -170,6 +170,29 @@ class Node(Base):
   runs: Mapped[list[Run]] = relationship("Run", back_populates="node")
 
 
+class RunBatch(Base):
+  __tablename__ = "run_batches"
+
+  id: Mapped[int] = mapped_column(
+    Integer, primary_key=True, autoincrement=True
+  )
+  version_id: Mapped[int] = mapped_column(
+    Integer, ForeignKey("mystran_versions.id"), nullable=False
+  )
+  # Discord snowflake of the user who submitted the batch.
+  submitted_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+  # Optional human-readable label for the batch.
+  label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+  # JSON-serialised summary of the filters used (for display).
+  filter_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+  created_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True), default=_utcnow, nullable=False
+  )
+
+  version: Mapped[MystranVersion] = relationship("MystranVersion")
+  runs: Mapped[list[Run]] = relationship("Run", back_populates="batch")
+
+
 class Run(Base):
   __tablename__ = "runs"
 
@@ -182,7 +205,7 @@ class Run(Base):
   version_id: Mapped[int] = mapped_column(
     Integer, ForeignKey("mystran_versions.id"), nullable=False
   )
-  # pending / running / completed / failed / cancelled
+  # pending / building / running / completed / failed / cancelled
   status: Mapped[str] = mapped_column(
     String(20), nullable=False, default="pending"
   )
@@ -190,12 +213,21 @@ class Run(Base):
   node_id: Mapped[int | None] = mapped_column(
     Integer, ForeignKey("nodes.id"), nullable=True
   )
+  # Batch this run belongs to, if submitted via /deck run-bulk.
+  batch_id: Mapped[int | None] = mapped_column(
+    Integer, ForeignKey("run_batches.id"), nullable=True
+  )
   # Discord snowflake of the user who submitted the run.
   submitted_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
   created_at: Mapped[datetime] = mapped_column(
     DateTime(timezone=True), default=_utcnow, nullable=False
   )
+  # Set when the node claims the run (build starts).
   started_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True), nullable=True
+  )
+  # Set when the binary is ready and MYSTRAN execution actually begins.
+  run_started_at: Mapped[datetime | None] = mapped_column(
     DateTime(timezone=True), nullable=True
   )
   completed_at: Mapped[datetime | None] = mapped_column(
@@ -213,6 +245,9 @@ class Run(Base):
     "MystranVersion", back_populates="runs"
   )
   node: Mapped[Node | None] = relationship("Node", back_populates="runs")
+  batch: Mapped[RunBatch | None] = relationship(
+    "RunBatch", back_populates="runs"
+  )
   files: Mapped[list[RunFile]] = relationship("RunFile", back_populates="run")
 
 

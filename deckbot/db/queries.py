@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
@@ -14,6 +15,7 @@ from deckbot.db.models import (
   MystranVersion,
   Node,
   Run,
+  RunBatch,
   RunFile,
   Setting,
 )
@@ -353,12 +355,12 @@ async def get_run(session: AsyncSession, run_id: int) -> Run | None:
 async def get_active_run_for_deck_version(
   session: AsyncSession, deck_id: int, version_id: int
 ) -> Run | None:
-  """Return an existing pending or running run for (deck, version), if any."""
+  """Return an existing pending, building, or running run for (deck, version)."""
   result = await session.execute(
     select(Run).where(
       Run.deck_id == deck_id,
       Run.version_id == version_id,
-      Run.status.in_(["pending", "running"]),
+      Run.status.in_(["pending", "building", "running"]),
     )
   )
   return result.scalar_one_or_none()
@@ -410,7 +412,7 @@ async def claim_pending_runs(
 ) -> list[Run]:
   """Atomically claim up to `slots` pending runs for a node.
 
-  Marks claimed runs as ``running``, sets ``node_id`` and ``started_at``.
+  Marks claimed runs as ``building``, sets ``node_id`` and ``started_at``.
   Returns the list of claimed Run objects (with deck + version loaded).
   """
   result = await session.execute(
@@ -423,7 +425,7 @@ async def claim_pending_runs(
   runs = list(result.scalars().all())
   now = datetime.now(UTC)
   for run in runs:
-    run.status = "running"
+    run.status = "building"
     run.node_id = node_id
     run.started_at = now
   return runs
@@ -463,8 +465,196 @@ async def count_pending_runs_for_deck_version(
     .select_from(Run)
     .where(
       Run.version_id == version_id,
-      Run.status.in_(["pending", "running"]),
+      Run.status.in_(["pending", "building", "running"]),
       Run.deck_id.in_(subq),
     )
   )
   return (await session.execute(count_q)).scalar_one()
+
+
+# ── Batches ───────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class BatchSummary:
+  total: int
+  by_status: dict[str, int] = field(default_factory=dict)
+  # finish breakdown for completed runs only
+  by_finish: dict[str, int] = field(default_factory=dict)
+  # valgrind breakdown for completed runs only
+  valgrind_clean: int = 0
+  valgrind_errors_found: int = 0
+  valgrind_no_data: int = 0
+  # runs where the error column is non-null (infrastructure / node errors)
+  infra_errors: int = 0
+
+
+async def create_batch(
+  session: AsyncSession,
+  version_id: int,
+  submitted_by: int,
+  label: str | None,
+  filter_summary: str | None,
+) -> RunBatch:
+  """Persist a new RunBatch and flush so its id is available."""
+  batch = RunBatch(
+    version_id=version_id,
+    submitted_by=submitted_by,
+    label=label,
+    filter_summary=filter_summary,
+    created_at=datetime.now(UTC),
+  )
+  session.add(batch)
+  await session.flush()
+  return batch
+
+
+async def get_batch(session: AsyncSession, batch_id: int) -> RunBatch | None:
+  """Return a RunBatch with its version loaded, or None."""
+  result = await session.execute(
+    select(RunBatch)
+    .options(selectinload(RunBatch.version))
+    .where(RunBatch.id == batch_id)
+  )
+  return result.scalar_one_or_none()
+
+
+async def list_recent_batches(
+  session: AsyncSession,
+  page: int,
+  per_page: int = 5,
+) -> tuple[list[RunBatch], int]:
+  """Return (page_of_batches, total_count) newest-first, version loaded."""
+  count_q = select(func.count()).select_from(RunBatch)
+  total: int = (await session.execute(count_q)).scalar_one()
+
+  result = await session.execute(
+    select(RunBatch)
+    .options(selectinload(RunBatch.version))
+    .order_by(RunBatch.created_at.desc())
+    .offset((page - 1) * per_page)
+    .limit(per_page)
+  )
+  return list(result.scalars().all()), total
+
+
+async def get_batch_summary(
+  session: AsyncSession, batch_id: int
+) -> BatchSummary:
+  """Return aggregate statistics for a batch's runs."""
+  # Status counts in a single GROUP BY query.
+  status_rows = await session.execute(
+    select(Run.status, func.count())
+    .where(Run.batch_id == batch_id)
+    .group_by(Run.status)
+  )
+  by_status = {row[0]: row[1] for row in status_rows}
+  total = sum(by_status.values())
+
+  # Finish breakdown — completed runs only.
+  finish_rows = await session.execute(
+    select(Run.finish, func.count())
+    .where(Run.batch_id == batch_id, Run.status == "completed")
+    .group_by(Run.finish)
+  )
+  by_finish: dict[str, int] = {}
+  for finish_val, cnt in finish_rows:
+    key = finish_val if finish_val is not None else "unknown"
+    by_finish[key] = cnt
+
+  # Valgrind stats — completed runs only.
+  valgrind_clean: int = (
+    await session.execute(
+      select(func.count()).where(
+        Run.batch_id == batch_id,
+        Run.status == "completed",
+        Run.valgrind_errors == 0,
+      )
+    )
+  ).scalar_one()
+
+  valgrind_errors_found: int = (
+    await session.execute(
+      select(func.count()).where(
+        Run.batch_id == batch_id,
+        Run.status == "completed",
+        Run.valgrind_errors > 0,
+      )
+    )
+  ).scalar_one()
+
+  valgrind_no_data: int = (
+    await session.execute(
+      select(func.count()).where(
+        Run.batch_id == batch_id,
+        Run.status == "completed",
+        Run.valgrind_errors.is_(None),
+      )
+    )
+  ).scalar_one()
+
+  # Infrastructure errors: any run whose error column is non-null.
+  infra_errors: int = (
+    await session.execute(
+      select(func.count()).where(
+        Run.batch_id == batch_id,
+        Run.error.is_not(None),
+      )
+    )
+  ).scalar_one()
+
+  return BatchSummary(
+    total=total,
+    by_status=by_status,
+    by_finish=by_finish,
+    valgrind_clean=valgrind_clean,
+    valgrind_errors_found=valgrind_errors_found,
+    valgrind_no_data=valgrind_no_data,
+    infra_errors=infra_errors,
+  )
+
+
+async def list_runs_for_batch(
+  session: AsyncSession,
+  batch_id: int,
+  page: int,
+  per_page: int = 10,
+) -> tuple[list[Run], int]:
+  """Return (page_of_runs, total_count) for a batch, newest-first."""
+  count_q = (
+    select(func.count()).select_from(Run).where(Run.batch_id == batch_id)
+  )
+  total: int = (await session.execute(count_q)).scalar_one()
+
+  result = await session.execute(
+    select(Run)
+    .options(
+      selectinload(Run.deck),
+      selectinload(Run.version),
+      selectinload(Run.node),
+    )
+    .where(Run.batch_id == batch_id)
+    .order_by(Run.created_at.asc())
+    .offset((page - 1) * per_page)
+    .limit(per_page)
+  )
+  return list(result.scalars().all()), total
+
+
+async def cancel_batch_runs(session: AsyncSession, batch_id: int) -> int:
+  """Cancel all pending and building runs in a batch.
+
+  Returns the number of runs that were cancelled.
+  """
+  result = await session.execute(
+    select(Run).where(
+      Run.batch_id == batch_id,
+      Run.status.in_(["pending", "building"]),
+    )
+  )
+  runs = list(result.scalars().all())
+  now = datetime.now(UTC)
+  for run in runs:
+    run.status = "cancelled"
+    run.completed_at = now
+  return len(runs)
