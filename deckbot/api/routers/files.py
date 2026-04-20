@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy import select
 
 from deckbot.api.deps import get_db_session
-from deckbot.db.models import Run, RunFile
+from deckbot.db.models import Deck, Run, RunFile
 
 router = APIRouter(tags=["files"])
 
@@ -35,7 +35,9 @@ async def _load_run_with_files(
   session: AsyncSession, run_id: int
 ) -> Run | None:
   result = await session.execute(
-    select(Run).options(selectinload(Run.files)).where(Run.id == run_id)
+    select(Run)
+    .options(selectinload(Run.files), selectinload(Run.deck))
+    .where(Run.id == run_id)
   )
   return result.scalar_one_or_none()
 
@@ -71,6 +73,27 @@ async def get_run_file(
   return Response(content=raw, media_type=content_type, headers=headers)
 
 
+@router.get("/run/{run_id}/deck")
+async def get_run_deck(
+  run_id: int,
+  session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> Response:
+  """Download the input deck file for a run."""
+  run = await _load_run_with_files(session, run_id)
+  if run is None:
+    raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+  deck: Deck = run.deck
+  raw = _DECOMPRESSOR.decompress(deck.content)
+  filename = deck.filename
+  content_type, disposition = _get_content_type(filename)
+  headers = {
+    "Content-Disposition": f'{disposition}; filename="{filename}"',
+    "Content-Length": str(len(raw)),
+  }
+  return Response(content=raw, media_type=content_type, headers=headers)
+
+
 @router.get("/run/{run_id}/zip")
 async def get_run_zip(
   run_id: int,
@@ -92,6 +115,9 @@ async def get_run_zip(
     for rf in run.files:
       raw = _DECOMPRESSOR.decompress(rf.content)
       zf.writestr(rf.filename, raw)
+    # Always include the input deck.
+    deck_raw = _DECOMPRESSOR.decompress(run.deck.content)
+    zf.writestr(run.deck.filename, deck_raw)
   buf.seek(0)
 
   zip_name = f"run_{run_id}.zip"

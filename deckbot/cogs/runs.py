@@ -232,8 +232,13 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
         links.append(f"[F06]({base}/run/{run.id}/files/{f06.filename})")
       if op2:
         links.append(f"[OP2]({base}/run/{run.id}/files/{op2.filename})")
-      if run_files:
-        links.append(f"[everything]({base}/run/{run.id}/zip)")
+      links.append(f"[deck]({base}/run/{run.id}/deck)")
+      stdout = next(
+        (f for f in run_files if f.filename.lower() == "stdout.txt"), None
+      )
+      if stdout:
+        links.append(f"[stdout]({base}/run/{run.id}/files/{stdout.filename})")
+      links.append(f"[everything]({base}/run/{run.id}/zip)")
     embed.add_field(
       name="Output files",
       value=" · ".join(links) if links else "—",
