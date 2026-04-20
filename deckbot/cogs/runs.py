@@ -1797,7 +1797,9 @@ class RunsCog(commands.Cog, name="Runs"):
     api_public_url = get_settings().api_public_url
     embed = _build_run_embed(run, api_public_url)
     done = run.status in _TERMINAL_STATUSES
-    view = None if done else RunStatusView(run_id, api_public_url)
+    view = (
+      discord.utils.MISSING if done else RunStatusView(run_id, api_public_url)
+    )
     await interaction.response.send_message(
       embed=embed, view=view, ephemeral=ephemeral
     )
