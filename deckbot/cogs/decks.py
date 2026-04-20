@@ -1245,7 +1245,7 @@ class DecksCog(commands.Cog, name="Decks"):
       info = DeckInfo(
         id=d.id,
         filename=d.filename,
-        sol=d.sol,
+        sol=SolType(d.sol) if d.sol else None,
         grid_count=d.grid_count,
         size_bytes=d.size_bytes,
         source_channel_id=d.source_channel_id,
@@ -1911,7 +1911,7 @@ class _RunSelect(discord.ui.Select):
     super().__init__(
       placeholder="View a run's details…",
       options=options,
-      row=1,
+      row=2,
     )
 
   async def callback(self, interaction: discord.Interaction) -> None:
@@ -2039,7 +2039,7 @@ class BatchView(discord.ui.View):
     )
 
   @discord.ui.button(
-    label="◄ Summary", style=discord.ButtonStyle.secondary, row=0
+    label="◄ Summary", style=discord.ButtonStyle.secondary, row=1
   )
   async def btn_summary(
     self,
@@ -2049,7 +2049,7 @@ class BatchView(discord.ui.View):
     await self._go_to_page(interaction, 0)
 
   @discord.ui.button(
-    label="◄ Prev", style=discord.ButtonStyle.secondary, row=0
+    label="◄ Prev", style=discord.ButtonStyle.secondary, row=1
   )
   async def btn_prev(
     self,
@@ -2059,7 +2059,7 @@ class BatchView(discord.ui.View):
     await self._go_to_page(interaction, self._page - 1)
 
   @discord.ui.button(
-    label="Next ►", style=discord.ButtonStyle.secondary, row=0
+    label="Next ►", style=discord.ButtonStyle.secondary, row=1
   )
   async def btn_next(
     self,
@@ -2069,7 +2069,7 @@ class BatchView(discord.ui.View):
     await self._go_to_page(interaction, self._page + 1)
 
   @discord.ui.button(
-    label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=0
+    label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=1
   )
   async def btn_refresh_runs(
     self,
