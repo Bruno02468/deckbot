@@ -387,20 +387,28 @@ async def get_any_run_for_deck_version(
 
 async def list_runs_for_deck(
   session: AsyncSession,
-  deck_id: int,
+  deck_id: int | None,
   *,
   page: int = 1,
-  per_page: int = 5,
+  per_page: int = 10,
 ) -> tuple[list[Run], int]:
-  """Return (page_of_runs, total_count) for a deck, newest-first."""
-  count_q = select(func.count()).select_from(Run).where(Run.deck_id == deck_id)
-  total: int = (await session.execute(count_q)).scalar_one()
+  """Return (page_of_runs, total_count) newest-first.
 
+  If *deck_id* is ``None``, returns runs across all decks.
+  """
+  base_q = select(Run).options(
+    selectinload(Run.deck),
+    selectinload(Run.version),
+    selectinload(Run.node),
+  )
+  count_q = select(func.count()).select_from(Run)
+  if deck_id is not None:
+    base_q = base_q.where(Run.deck_id == deck_id)
+    count_q = count_q.where(Run.deck_id == deck_id)
+
+  total: int = (await session.execute(count_q)).scalar_one()
   result = await session.execute(
-    select(Run)
-    .options(selectinload(Run.version), selectinload(Run.node))
-    .where(Run.deck_id == deck_id)
-    .order_by(Run.created_at.desc())
+    base_q.order_by(Run.created_at.desc())
     .offset((page - 1) * per_page)
     .limit(per_page)
   )

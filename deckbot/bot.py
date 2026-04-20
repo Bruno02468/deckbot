@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 COGS: list[str] = [
   "deckbot.cogs.listener",
   "deckbot.cogs.admin",
+  "deckbot.cogs.runs",
   "deckbot.cogs.decks",
 ]
 
