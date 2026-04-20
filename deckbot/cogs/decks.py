@@ -5,6 +5,7 @@ import logging
 import math
 import zipfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -92,6 +93,11 @@ def _fmt_size(n: int) -> str:
   return f"{n / 1024 / 1024:.1f} MB"
 
 
+def _ts(dt: datetime, fmt: str = "f") -> str:
+  """Format a UTC-aware datetime as a Discord timestamp tag."""
+  return f"<t:{int(dt.timestamp())}:{fmt}>"
+
+
 def _fmt_deck(deck: DeckInfo) -> tuple[str, str]:
   """Return (field_name, field_value) for a deck embed field."""
   name = f"#{deck.id} {deck.filename}"
@@ -104,7 +110,7 @@ def _fmt_deck(deck: DeckInfo) -> tuple[str, str]:
     parts.append("Tags: " + ", ".join(f"`{t}`" for t in deck.tags))
   value = " · ".join(parts)
   # Source line: channel mention, date, and jump link together.
-  date_str = deck.discovered_at.strftime("%Y-%m-%d")
+  date_str = _ts(deck.discovered_at.replace(tzinfo=UTC), "d")
   if deck.source_url and deck.source_channel_id:
     value += (
       f"\n<#{deck.source_channel_id}> · {date_str} · [jump]({deck.source_url})"

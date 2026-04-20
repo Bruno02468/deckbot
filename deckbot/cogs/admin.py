@@ -59,6 +59,11 @@ _STATUS_EMOJI = {
 }
 
 
+def _ts(dt: datetime, fmt: str = "f") -> str:
+  """Format a UTC-aware datetime as a Discord timestamp tag."""
+  return f"<t:{int(dt.timestamp())}:{fmt}>"
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 
@@ -398,7 +403,7 @@ class AdminCog(commands.Cog, name="Admin"):
       lines: list[str] = []
       for job in rows:
         emoji = _STATUS_EMOJI.get(job.status, "❓")
-        ts = job.created_at.strftime("%Y-%m-%d %H:%M UTC")
+        ts = _ts(job.created_at.replace(tzinfo=UTC))
         error_suffix = ""
         if job.error:
           # Truncate long error messages to keep the embed readable.
@@ -505,7 +510,7 @@ class AdminCog(commands.Cog, name="Admin"):
           f"{node.max_threads}t" if node.max_threads is not None else "?"
         )
         last = (
-          node.last_seen_at.strftime("%Y-%m-%d %H:%M UTC")
+          _ts(node.last_seen_at.replace(tzinfo=UTC))
           if node.last_seen_at
           else "never"
         )

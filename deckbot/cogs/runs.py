@@ -82,6 +82,11 @@ _FINISH_EMOJI: dict[str, str] = {
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
+def _ts(dt: datetime, fmt: str = "f") -> str:
+  """Format a UTC-aware datetime as a Discord timestamp tag."""
+  return f"<t:{int(dt.timestamp())}:{fmt}>"
+
+
 def _is_ephemeral(
   interaction: discord.Interaction, deckbot_channel_id: int | None
 ) -> bool:
@@ -146,7 +151,7 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
   created = run.created_at.replace(tzinfo=UTC)
   embed.add_field(
     name="Queued",
-    value=created.strftime("%Y-%m-%d %H:%M UTC"),
+    value=_ts(created),
     inline=True,
   )
 
@@ -159,7 +164,7 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
     build_started = run.started_at.replace(tzinfo=UTC)
     embed.add_field(
       name="Build started",
-      value=build_started.strftime("%Y-%m-%d %H:%M UTC"),
+      value=_ts(build_started),
       inline=True,
     )
     embed.add_field(
@@ -178,7 +183,7 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
     if run_started:
       embed.add_field(
         name="Started",
-        value=run_started.strftime("%Y-%m-%d %H:%M UTC"),
+        value=_ts(run_started),
         inline=True,
       )
       embed.add_field(
@@ -192,9 +197,7 @@ def _build_run_embed(run: Run, api_public_url: str | None) -> discord.Embed:
   elif run.completed_at:
     embed.add_field(
       name="Completed",
-      value=run.completed_at.replace(tzinfo=UTC).strftime(
-        "%Y-%m-%d %H:%M UTC"
-      ),
+      value=_ts(run.completed_at.replace(tzinfo=UTC)),
       inline=True,
     )
     exec_start = (
@@ -306,7 +309,7 @@ def _add_run_field(embed: discord.Embed, run: Run) -> None:
   if verrs is not None:
     parts.append(f"{'🧹' if verrs == 0 else '🐛'} {verrs} valgrind error(s)")
 
-  parts.append(created.strftime("%Y-%m-%d %H:%M UTC"))
+  parts.append(_ts(created))
   embed.add_field(name=name, value=" · ".join(parts), inline=False)
 
 
@@ -590,7 +593,7 @@ def _build_batch_summary_embed(
   )
   embed.add_field(
     name="Created",
-    value=batch.created_at.replace(tzinfo=UTC).strftime("%Y-%m-%d %H:%M UTC"),
+    value=_ts(batch.created_at.replace(tzinfo=UTC)),
     inline=True,
   )
   if batch.filter_summary:
@@ -1832,9 +1835,7 @@ class RunsCog(commands.Cog, name="Runs"):
       ref = batch.version.ref_name or batch.version.commit_hash[:8]
       version_str = f"`{batch.version.repo_name}@{ref}`"
       label_str = f" — {batch.label}" if batch.label else ""
-      created_str = batch.created_at.replace(tzinfo=UTC).strftime(
-        "%Y-%m-%d %H:%M UTC"
-      )
+      created_str = _ts(batch.created_at.replace(tzinfo=UTC))
       embed.add_field(
         name=f"Batch #{batch.id}{label_str}",
         value=(f"{version_str} · <@{batch.submitted_by}> · {created_str}"),
