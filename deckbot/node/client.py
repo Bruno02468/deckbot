@@ -31,6 +31,9 @@ class NodeClient:
     # Number of currently running jobs.  Safe without a lock since asyncio
     # is single-threaded; incremented/decremented only in async callbacks.
     self._active: int = 0
+    # Run IDs this node is currently responsible for.  Sent with every
+    # keepalive so the server can detect ghost runs.
+    self._active_run_ids: set[int] = set()
 
   async def run(self) -> None:
     """Start and run until cancelled (e.g. KeyboardInterrupt / SIGTERM)."""
@@ -57,7 +60,10 @@ class NodeClient:
     try:
       resp = await self._http.post(
         "/api/v1/keepalive",
-        json={"max_threads": self._config.max_threads},
+        json={
+          "max_threads": self._config.max_threads,
+          "running_run_ids": list(self._active_run_ids),
+        },
       )
       resp.raise_for_status()
       log.debug("Keepalive OK")
@@ -85,6 +91,7 @@ class NodeClient:
         if jobs:
           log.info("Claimed %d job(s)", len(jobs))
           for job in jobs:
+            self._active_run_ids.add(job.run_id)
             asyncio.ensure_future(self._run_job(job))
           # Poll again quickly in case there are more jobs waiting.
           await asyncio.sleep(2.0)
@@ -104,3 +111,4 @@ class NodeClient:
       await run_job(job, self._http, self._config)
     finally:
       self._active -= 1
+      self._active_run_ids.discard(job.run_id)

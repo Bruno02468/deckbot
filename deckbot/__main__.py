@@ -59,6 +59,9 @@ def main() -> None:
       level=logging.INFO,
       format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # httpx logs every HTTP request at INFO — suppress routine
+    # keepalive and poll requests so only warnings/errors surface.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     client = NodeClient(get_node_settings())
     try:

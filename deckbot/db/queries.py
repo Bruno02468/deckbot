@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -304,6 +304,63 @@ async def get_node_by_name(session: AsyncSession, name: str) -> Node | None:
 async def list_nodes(session: AsyncSession) -> list[Node]:
   result = await session.execute(select(Node).order_by(Node.created_at.asc()))
   return list(result.scalars().all())
+
+
+_DEFAULT_ORPHAN_GRACE = 180  # seconds
+
+
+async def reset_orphaned_runs(
+  session: AsyncSession,
+  node_id: int,
+  reported_run_ids: list[int],
+  grace_seconds: int = _DEFAULT_ORPHAN_GRACE,
+) -> list[int]:
+  """Reset ghost runs back to ``pending`` for re-execution.
+
+  A ghost run is one that the server believes is active on *node_id*
+  (``status`` is ``building`` or ``running``) but whose ID was **not**
+  included in the node's keepalive report *and* whose ``started_at``
+  timestamp is older than *grace_seconds*.  The grace period avoids
+  false positives for runs that were just claimed and haven't yet
+  appeared in the node's tracking set.
+
+  Resets each orphan to ``pending`` and clears ``node_id``,
+  ``started_at``, and ``run_started_at`` so it can be claimed afresh.
+  Any stray ``RunFile`` rows (defensive) are deleted first.
+
+  Returns the list of run IDs that were reset.
+  """
+  cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
+
+  result = await session.execute(
+    select(Run).where(
+      Run.node_id == node_id,
+      Run.status.in_(("building", "running")),
+      Run.started_at < cutoff,
+      Run.id.not_in(reported_run_ids) if reported_run_ids else True,
+    )
+  )
+  orphans = list(result.scalars().all())
+  if not orphans:
+    return []
+
+  orphan_ids = [r.id for r in orphans]
+
+  # Delete any stray output files (shouldn't exist for incomplete runs,
+  # but clean up defensively before resetting status).
+  await session.execute(delete(RunFile).where(RunFile.run_id.in_(orphan_ids)))
+
+  for run in orphans:
+    run.status = "pending"
+    run.node_id = None
+    run.started_at = None
+    run.run_started_at = None
+    run.exit_code = None
+    run.finish = None
+    run.valgrind_errors = None
+    run.error = None
+
+  return orphan_ids
 
 
 # ── MystranVersions ───────────────────────────────────────────────────────────
