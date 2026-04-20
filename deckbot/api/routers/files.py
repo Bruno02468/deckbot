@@ -19,7 +19,7 @@ router = APIRouter(tags=["files"])
 _DECOMPRESSOR = zstd.ZstdDecompressor()
 
 # Content-types served inline (browser opens as text) rather than as download.
-_INLINE_SUFFIXES = {".f06", ".f04", ".log", ".txt"}
+_INLINE_SUFFIXES = {".f06", ".f04", ".log", ".txt", ".bdf", ".dat", ".nas"}
 
 
 def _get_content_type(filename: str) -> tuple[str, str]:
