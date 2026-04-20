@@ -1281,9 +1281,10 @@ class DecksCog(commands.Cog, name="Decks"):
       )
       return
 
-    deck_list = ", ".join(f"`#{d.id}` {d.filename}" for d in decks)
+    noun = "deck" if len(decks) == 1 else "decks"
+    ids = ", ".join(f"`#{d.id}`" for d in decks)
     await interaction.response.send_message(
-      f"{len(decks)} deck(s) found: {deck_list}\n"
+      f"{len(decks)} {noun} found ({ids}). "
       "Choose a tag and click **Apply** or **Remove**.",
       view=_TagDecksView(decks),
       ephemeral=True,
