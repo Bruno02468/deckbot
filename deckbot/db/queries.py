@@ -666,3 +666,108 @@ async def cancel_batch_runs(session: AsyncSession, batch_id: int) -> int:
     run.status = "cancelled"
     run.completed_at = now
   return len(runs)
+
+
+# ── Run search ────────────────────────────────────────────────────────────────
+
+RUNS_SEARCH_PER_PAGE = 10
+
+
+async def search_runs(
+  session: AsyncSession,
+  *,
+  deck_id: int | None = None,
+  deck_name: str | None = None,
+  status: str | None = None,
+  finish: str | None = None,
+  node_id: int | None = None,
+  batch_id: int | None = None,
+  submitted_by: int | None = None,
+  min_elapsed_s: int | None = None,
+  max_elapsed_s: int | None = None,
+  valgrind: str | None = None,
+  sort_by: str = "newest",
+  page: int = 1,
+  per_page: int = RUNS_SEARCH_PER_PAGE,
+) -> tuple[list[Run], int]:
+  """Filtered, paginated run search.
+
+  *deck_name* does a case-insensitive substring match on Deck.filename.
+  *valgrind* accepts: ``"clean"`` (errors == 0), ``"errors"`` (errors > 0),
+  ``"no_data"`` (errors IS NULL), or ``None`` (no filter).
+
+  *sort_by* accepts: ``"newest"`` (created_at DESC), ``"oldest"``
+  (created_at ASC), ``"longest"`` (elapsed DESC, nulls last),
+  ``"shortest"`` (elapsed ASC, nulls last).
+
+  Elapsed is computed as ``completed_at - run_started_at`` when both are
+  present, falling back to ``completed_at - started_at``.
+  """
+  from sqlalchemy import case, nulls_last  # noqa: PLC0415
+
+  base_q = select(Run).options(
+    selectinload(Run.deck),
+    selectinload(Run.version),
+    selectinload(Run.node),
+  )
+  count_q = select(func.count()).select_from(Run)
+
+  filters = []
+  if deck_id is not None:
+    filters.append(Run.deck_id == deck_id)
+  if deck_name is not None:
+    filters.append(
+      Run.deck_id.in_(
+        select(Deck.id).where(Deck.filename.ilike(f"%{deck_name}%"))
+      )
+    )
+  if status is not None:
+    filters.append(Run.status == status)
+  if finish is not None:
+    if finish == "none":
+      filters.append(Run.finish.is_(None))
+    else:
+      filters.append(Run.finish == finish)
+  if node_id is not None:
+    filters.append(Run.node_id == node_id)
+  if batch_id is not None:
+    filters.append(Run.batch_id == batch_id)
+  if submitted_by is not None:
+    filters.append(Run.submitted_by == submitted_by)
+  if valgrind == "clean":
+    filters.append(Run.valgrind_errors == 0)
+  elif valgrind == "errors":
+    filters.append(Run.valgrind_errors > 0)
+  elif valgrind == "no_data":
+    filters.append(Run.valgrind_errors.is_(None))
+
+  # Elapsed filter: prefer run_started_at if available, fall back to
+  # started_at. Only applied when a bound is requested.
+  elapsed_expr = case(
+    (Run.run_started_at.is_not(None), Run.completed_at - Run.run_started_at),
+    else_=Run.completed_at - Run.started_at,
+  )
+  if min_elapsed_s is not None:
+    filters.append(elapsed_expr >= min_elapsed_s)
+  if max_elapsed_s is not None:
+    filters.append(elapsed_expr <= max_elapsed_s)
+
+  if filters:
+    base_q = base_q.where(*filters)
+    count_q = count_q.where(*filters)
+
+  # Sorting
+  if sort_by == "oldest":
+    order = Run.created_at.asc()
+  elif sort_by == "longest":
+    order = nulls_last(elapsed_expr.desc())
+  elif sort_by == "shortest":
+    order = nulls_last(elapsed_expr.asc())
+  else:  # "newest" (default)
+    order = Run.created_at.desc()
+
+  total: int = (await session.execute(count_q)).scalar_one()
+  result = await session.execute(
+    base_q.order_by(order).offset((page - 1) * per_page).limit(per_page)
+  )
+  return list(result.scalars().all()), total

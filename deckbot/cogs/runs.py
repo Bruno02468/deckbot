@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
@@ -28,10 +29,12 @@ from deckbot.db.queries import (
   get_decks_by_hashes,
   get_decks_by_message,
   get_or_create_version,
+  get_node_by_name,
   get_run,
   list_recent_batches,
   list_runs_for_batch,
   list_runs_for_deck,
+  search_runs,
 )
 from deckbot.db.session import get_session
 from deckbot.models.deck import DeckInfo  # noqa: F401
@@ -1070,6 +1073,180 @@ async def _resolve_decks_from_message(
   return await get_decks_by_hashes(session, hashes)
 
 
+# ── Run search helpers ────────────────────────────────────────────────────────
+
+_DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+
+
+def _parse_duration(s: str) -> int | None:
+  """Parse a human duration string to total seconds.
+
+  Accepts: ``30s``, ``5m``, ``2h``, ``1h30m``, ``1h30m45s``.
+  Returns ``None`` if the string is blank or doesn't match.
+  """
+  m = _DURATION_RE.fullmatch(s.strip().lower())
+  if m is None or not any(m.groups()):
+    return None
+  h = int(m.group(1) or 0)
+  mins = int(m.group(2) or 0)
+  secs = int(m.group(3) or 0)
+  return h * 3600 + mins * 60 + secs
+
+
+@dataclass
+class RunSearchParams:
+  deck_id: int | None = None
+  deck_name: str | None = None
+  status: str | None = None
+  finish: str | None = None
+  node: str | None = None
+  node_id: int | None = None
+  batch_id: int | None = None
+  submitted_by_id: int | None = None
+  submitted_by_name: str | None = None
+  min_elapsed_s: int | None = None
+  max_elapsed_s: int | None = None
+  min_elapsed_label: str | None = None
+  max_elapsed_label: str | None = None
+  valgrind: str | None = None
+  sort_by: str = "newest"
+
+  def filter_summary(self) -> str:
+    parts: list[str] = []
+    if self.deck_id is not None:
+      parts.append(f"deck #{self.deck_id}")
+    elif self.deck_name is not None:
+      parts.append(f"deck~{self.deck_name!r}")
+    if self.status is not None:
+      parts.append(f"status={self.status}")
+    if self.finish is not None:
+      parts.append(f"finish={self.finish}")
+    if self.node is not None:
+      parts.append(f"node={self.node}")
+    if self.batch_id is not None:
+      parts.append(f"batch #{self.batch_id}")
+    if self.submitted_by_name is not None:
+      parts.append(f"by {self.submitted_by_name}")
+    if self.min_elapsed_label is not None:
+      parts.append(f"elapsed≥{self.min_elapsed_label}")
+    if self.max_elapsed_label is not None:
+      parts.append(f"elapsed≤{self.max_elapsed_label}")
+    if self.valgrind is not None:
+      parts.append(f"valgrind={self.valgrind}")
+    return ", ".join(parts) if parts else "all runs"
+
+
+# ── Run search view ───────────────────────────────────────────────────────────
+
+
+class RunSearchView(discord.ui.View):
+  """Paginated view for /run search results."""
+
+  def __init__(
+    self,
+    params: RunSearchParams,
+    runs: list[Run],
+    total: int,
+    page: int,
+    ephemeral: bool,
+    invoker_id: int,
+  ) -> None:
+    super().__init__(timeout=_VIEW_TIMEOUT)
+    self.message: discord.Message | None = None
+    self._params = params
+    self._runs = runs
+    self._total = total
+    self._page = page
+    self._ephemeral = ephemeral
+    self._invoker_id = invoker_id
+    self._per_page = RUNS_PER_BATCH_PAGE
+    self._update_buttons()
+
+  def _total_pages(self) -> int:
+    return max(1, math.ceil(self._total / self._per_page))
+
+  def _update_buttons(self) -> None:
+    self.prev_button.disabled = self._page <= 1
+    self.next_button.disabled = self._page >= self._total_pages()
+
+  def _build_embed(self) -> discord.Embed:
+    sort_label = {
+      "newest": "newest first",
+      "oldest": "oldest first",
+      "longest": "longest elapsed",
+      "shortest": "shortest elapsed",
+    }.get(self._params.sort_by, self._params.sort_by)
+    embed = discord.Embed(
+      title=(
+        f"Run search — {self._params.filter_summary()} "
+        f"[{sort_label}] — "
+        f"page {self._page}/{self._total_pages()} (total: {self._total})"
+      ),
+      colour=discord.Colour.blurple(),
+    )
+    for r in self._runs:
+      _add_run_field(embed, r)
+    return embed
+
+  async def _go_to(
+    self, interaction: discord.Interaction, new_page: int
+  ) -> None:
+    if interaction.user.id != self._invoker_id:
+      await interaction.response.send_message(
+        "These buttons belong to someone else's search.", ephemeral=True
+      )
+      return
+    async with get_session() as session:
+      runs, total = await search_runs(
+        session,
+        deck_id=self._params.deck_id,
+        deck_name=self._params.deck_name,
+        status=self._params.status,
+        finish=self._params.finish,
+        node_id=self._params.node_id,
+        batch_id=self._params.batch_id,
+        submitted_by=self._params.submitted_by_id,
+        min_elapsed_s=self._params.min_elapsed_s,
+        max_elapsed_s=self._params.max_elapsed_s,
+        valgrind=self._params.valgrind,
+        sort_by=self._params.sort_by,
+        page=new_page,
+        per_page=self._per_page,
+      )
+    self._runs = runs
+    self._total = total
+    self._page = new_page
+    self._update_buttons()
+    await interaction.response.edit_message(
+      embed=self._build_embed(), view=self
+    )
+
+  @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+  async def prev_button(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to(interaction, self._page - 1)
+
+  @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+  async def next_button(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._go_to(interaction, self._page + 1)
+
+  async def on_timeout(self) -> None:
+    self.prev_button.disabled = True
+    self.next_button.disabled = True
+    if self.message is not None:
+      try:
+        await self.message.edit(view=self)
+      except discord.HTTPException:
+        pass
+
+
 # ── RunsCog ───────────────────────────────────────────────────────────────────
 
 
@@ -1431,6 +1608,165 @@ class RunsCog(commands.Cog, name="Runs"):
     for r in runs:
       _add_run_field(embed, r)
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+  # ── /run search ──────────────────────────────────────────────────────────
+
+  @run.command(
+    name="search",
+    description="Search runs with filters",
+  )
+  @app_commands.describe(
+    deck="Filter by deck ID (number) or filename substring",
+    status="Filter by run status",
+    finish="Filter by finish type (normal/fatal/crash/none)",
+    node="Filter by compute node name",
+    batch_id="Filter by batch ID",
+    submitter="Filter by the Discord member who submitted the run",
+    min_elapsed="Minimum elapsed time, e.g. 30s / 5m / 1h",
+    max_elapsed="Maximum elapsed time, e.g. 30s / 5m / 1h",
+    valgrind="Filter by valgrind result",
+    sort_by="Sort order",
+  )
+  @app_commands.choices(
+    status=[
+      app_commands.Choice(name="pending", value="pending"),
+      app_commands.Choice(name="building", value="building"),
+      app_commands.Choice(name="running", value="running"),
+      app_commands.Choice(name="completed", value="completed"),
+      app_commands.Choice(name="failed", value="failed"),
+      app_commands.Choice(name="cancelled", value="cancelled"),
+    ],
+    finish=[
+      app_commands.Choice(name="normal", value="normal"),
+      app_commands.Choice(name="fatal", value="fatal"),
+      app_commands.Choice(name="crash", value="crash"),
+      app_commands.Choice(name="none (not yet set)", value="none"),
+    ],
+    valgrind=[
+      app_commands.Choice(name="clean (0 errors)", value="clean"),
+      app_commands.Choice(name="errors found", value="errors"),
+      app_commands.Choice(name="no data", value="no_data"),
+    ],
+    sort_by=[
+      app_commands.Choice(name="newest first", value="newest"),
+      app_commands.Choice(name="oldest first", value="oldest"),
+      app_commands.Choice(name="longest elapsed", value="longest"),
+      app_commands.Choice(name="shortest elapsed", value="shortest"),
+    ],
+  )
+  async def search_cmd(
+    self,
+    interaction: discord.Interaction,
+    deck: str | None = None,
+    status: str | None = None,
+    finish: str | None = None,
+    node: str | None = None,
+    batch_id: int | None = None,
+    submitter: discord.Member | None = None,
+    min_elapsed: str | None = None,
+    max_elapsed: str | None = None,
+    valgrind: str | None = None,
+    sort_by: str = "newest",
+  ) -> None:
+    # Validate elapsed strings up front.
+    min_elapsed_s: int | None = None
+    max_elapsed_s: int | None = None
+    if min_elapsed is not None:
+      min_elapsed_s = _parse_duration(min_elapsed)
+      if min_elapsed_s is None:
+        await interaction.response.send_message(
+          f"Couldn't parse `min_elapsed` value `{min_elapsed}`. "
+          "Use formats like `30s`, `5m`, `1h`, `1h30m`.",
+          ephemeral=True,
+        )
+        return
+    if max_elapsed is not None:
+      max_elapsed_s = _parse_duration(max_elapsed)
+      if max_elapsed_s is None:
+        await interaction.response.send_message(
+          f"Couldn't parse `max_elapsed` value `{max_elapsed}`. "
+          "Use formats like `30s`, `5m`, `1h`, `1h30m`.",
+          ephemeral=True,
+        )
+        return
+
+    # Resolve deck to ID or name, and node to ID.
+    deck_id: int | None = None
+    deck_name: str | None = None
+    if deck is not None:
+      try:
+        deck_id = int(deck)
+      except ValueError:
+        deck_name = deck
+
+    node_id: int | None = None
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      if node is not None:
+        node_row = await get_node_by_name(session, node)
+        if node_row is None:
+          await interaction.response.send_message(
+            f"No node named `{node}`.", ephemeral=True
+          )
+          return
+        node_id = node_row.id
+
+      params = RunSearchParams(
+        deck_id=deck_id,
+        deck_name=deck_name,
+        status=status,
+        finish=finish,
+        node=node,
+        node_id=node_id,
+        batch_id=batch_id,
+        submitted_by_id=submitter.id if submitter is not None else None,
+        submitted_by_name=(
+          submitter.display_name if submitter is not None else None
+        ),
+        min_elapsed_s=min_elapsed_s,
+        max_elapsed_s=max_elapsed_s,
+        min_elapsed_label=min_elapsed,
+        max_elapsed_label=max_elapsed,
+        valgrind=valgrind,
+        sort_by=sort_by,
+      )
+
+      runs, total = await search_runs(
+        session,
+        deck_id=params.deck_id,
+        deck_name=params.deck_name,
+        status=params.status,
+        finish=params.finish,
+        node_id=params.node_id,
+        batch_id=params.batch_id,
+        submitted_by=params.submitted_by_id,
+        min_elapsed_s=params.min_elapsed_s,
+        max_elapsed_s=params.max_elapsed_s,
+        valgrind=params.valgrind,
+        sort_by=params.sort_by,
+        page=1,
+      )
+
+    if not runs:
+      await interaction.response.send_message(
+        "No runs match those filters.", ephemeral=ephemeral
+      )
+      return
+
+    view = RunSearchView(
+      params=params,
+      runs=runs,
+      total=total,
+      page=1,
+      ephemeral=ephemeral,
+      invoker_id=interaction.user.id,
+    )
+    await interaction.response.send_message(
+      embed=view._build_embed(), view=view, ephemeral=ephemeral
+    )
+    view.message = await interaction.original_response()
 
   # ── /run status ───────────────────────────────────────────────────────────
 

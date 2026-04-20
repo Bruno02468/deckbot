@@ -46,8 +46,14 @@ deckbot/
     listener.py    — on_message: processes attachments in tracked channels in real time
     admin.py       — /deckbot group (admin-only): setup, track, untrack, channels, crawl,
                      reprocess, status, jobs, node-create, node-list, node-remove
-    decks.py       — /deck group: list, search, tag, untag, run, run-bulk, repos, runs,
-                     run-status, batches
+    decks.py       — /deck group: list, search, tag, untag, repos, runs (deck_id required);
+                     context menus: "Deck info", "Tag deck(s)"
+    runs.py        — /run group: run, bulk, list, search, status, batches, batch;
+                     context menu: "Run this deck"
+                     Views: RunSearchView (paginated), RunStatusView, BatchView,
+                     RunDeckModal, _BulkConfirmView
+                     Helpers: _parse_duration(), RunSearchParams, _build_run_embed(),
+                     _add_run_field(), _build_batch_summary_embed()
   services/
     deck_parser.py — parse_deck() → DeckProperties (SolType | None, grid_count); hash_deck(); compress_deck()
     zip_handler.py — extract_decks(): recursive ZIP extraction, depth ≤ 3, ≤ 50 MB total
@@ -97,7 +103,7 @@ deckbot-node.service — systemd unit template for volunteer compute nodes
 - **mystran_versions** `(id, repo_name, commit_hash, ref_name, UNIQUE(repo_name, commit_hash))` — resolved MYSTRAN versions
 - **nodes** `(id, name UNIQUE, api_key_hash, last_seen_at, max_threads, is_active)` — registered compute nodes; `api_key_hash` is SHA-256 of the raw key
 - **runs** `(id, deck_id FK, version_id FK, batch_id FK, node_id FK, status, submitted_by, created_at, started_at, run_started_at, completed_at, exit_code, error)` — run queue; statuses: `pending / building / running / completed / failed / cancelled`; `started_at` = node claimed run (build start); `run_started_at` = binary ready, execution start
-- **run_batches** `(id, version_id FK, submitted_by, label, filter_summary JSON, created_at)` — groups runs created by `/deck run-bulk`; `label` is optional free-text; `filter_summary` records the filters used
+- **run_batches** `(id, version_id FK, submitted_by, label, filter_summary JSON, created_at)` — groups runs created by `/run bulk`; `label` is optional free-text; `filter_summary` records the filters used
 - **run_files** `(id, run_id FK, filename, content BLOB, size_bytes, stored_at)` — zstd-compressed output files from a completed run
 
 ## Core behaviours to know
@@ -112,9 +118,11 @@ deckbot-node.service — systemd unit template for volunteer compute nodes
 - **SOL normalization**: raw SOL strings are mapped to a canonical `SolType` via a lookup table in `models/sol.py`. `NULL` = no SOL line; `"unknown"` = SOL found but not in the table. Run `/deckbot reprocess <channel>` after any change to the lookup table.
 - **JobRunner job types**: `crawl_channel` and `reprocess_channel`.
 - All datetimes are UTC-aware (`datetime.now(UTC)`). SQLite returns naive datetimes; apply `.replace(tzinfo=UTC)` before arithmetic.
-- **Run submission**: manual only (no auto-run on crawl). `/deck run` submits a single deck; `/deck run-bulk` submits all decks matching a search query (requires confirmation if ≥ 50 decks), groups them into a `RunBatch`, and posts a live-updating `BatchView` embed. `/deck batches` lists recent batches (5/page) with buttons to open a batch's summary.
+- **Run submission**: manual only (no auto-run on crawl). `/run run` submits a single deck; `/run bulk` submits all decks matching a search query (requires confirmation if ≥ 50 decks), groups them into a `RunBatch`, and posts a live-updating `BatchView` embed. `/run batches` lists recent batches (5/page) with buttons to open a batch's summary. The "Run this deck" context menu on any message opens `RunDeckModal`.
 - **Run status flow**: `pending → building` (node claims run) `→ running` (node calls `/start` after binary is ready) `→ completed / failed`. `cancelled` is set by the user via the batch cancel button. Runs with an active status (`pending / building / running`) are skipped when re-submitting the same deck+version.
 - **Batch summary embed** (`BatchView` page 0): total runs, per-status counts, finish-type breakdown (normal/fatal/crash), valgrind clean/errors/no-data counts, infrastructure error count. Page ≥ 1 shows a paginated run list (10/page) with a per-run dropdown for detail. The embed auto-updates every 30 s (up to 30 min) via a background task.
+- **Run search**: `/run search` supports optional filters — `deck` (ID or filename substring), `status`, `finish`, `node` (name), `batch_id`, `submitter` (Discord member), `min_elapsed`/`max_elapsed` (e.g. `5m`, `1h30m`), `valgrind` (clean/errors/no_data), `sort_by` (newest/oldest/longest/shortest). Results are paginated via `RunSearchView` (prev/next buttons, invoker-only). Duration strings parsed by `_parse_duration()` in `cogs/runs.py`.
+- **`/deck runs`** — stays in `decks.py`, requires a `deck_id`; shows the run history for that deck. `/run list` is the equivalent with optional `deck_id`.
 - **Approved repos**: static dict in `models/repo.py`. Currently: `{"mystran": "https://github.com/MYSTRANsolver/MYSTRAN.git"}`. Version refs are resolved to full SHA-1 via `git ls-remote`.
 - **Node API auth**: `X-API-Key` header; key is SHA-256-hashed before storage. Key is shown exactly once at node creation (`/deckbot node-create`).
 - **Binary cache**: nodes cache built binaries at `{build_cache_dir}/binaries/{repo_name}/{commit_hash}/mystran`. Build uses CMake `Debug` mode. Shared repo clone lives at `{build_cache_dir}/repos/{repo_name}/`. One asyncio.Lock per repo prevents concurrent builds.
