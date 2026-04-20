@@ -1265,7 +1265,7 @@ class DecksCog(commands.Cog, name="Decks"):
     interaction: discord.Interaction,
     message: discord.Message,
   ) -> None:
-    if not await _is_deckbot_admin(interaction):
+    if not _is_deckbot_admin(interaction):
       await interaction.response.send_message(
         "You need the `deckbot` role or administrator permission to tag decks.",
         ephemeral=True,
