@@ -1241,11 +1241,52 @@ class DecksCog(commands.Cog, name="Decks"):
       colour=discord.Colour.orange(),
     )
     for d in decks:
-      info = DeckInfo.model_validate(d)
+      info = DeckInfo(
+        id=d.id,
+        filename=d.filename,
+        sol=d.sol,
+        grid_count=d.grid_count,
+        size_bytes=d.size_bytes,
+        source_channel_id=d.source_channel_id,
+        source_url=d.source_url,
+        discovered_at=d.discovered_at,
+        tags=[t.tag for t in d.tags],
+      )
       field_name, field_value = _fmt_deck(info)
       embed.add_field(name=field_name, value=field_value, inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+  # ── Context menu: "Tag deck(s)" ────────────────────────────────────────────────
+
+  async def _ctx_tag_decks(
+    self,
+    interaction: discord.Interaction,
+    message: discord.Message,
+  ) -> None:
+    if not await _is_deckbot_admin(interaction):
+      await interaction.response.send_message(
+        "You need the `deckbot` role or administrator permission to tag decks.",
+        ephemeral=True,
+      )
+      return
+
+    async with get_session() as session:
+      decks = await _resolve_decks_from_message(message, session)
+
+    if not decks:
+      await interaction.response.send_message(
+        "No processed deck found in that message.", ephemeral=True
+      )
+      return
+
+    deck_list = ", ".join(f"`#{d.id}` {d.filename}" for d in decks)
+    await interaction.response.send_message(
+      f"{len(decks)} deck(s) found: {deck_list}\n"
+      "Choose a tag and click **Apply** or **Remove**.",
+      view=_TagDecksView(decks),
+      ephemeral=True,
+    )
 
 
 # ── Deck-select view (context menu, multi-deck messages) ──────────────────────
@@ -1628,6 +1669,99 @@ async def _auto_update_run(
     except (discord.HTTPException, asyncio.CancelledError):
       # Message may have been deleted or we lost access — stop silently.
       break
+
+
+# ── Tag deck(s) view ──────────────────────────────────────────────────────────
+
+
+class _TagDecksView(discord.ui.View):
+  """Apply or remove a tag on all decks resolved from a message."""
+
+  def __init__(self, decks: list[Deck]) -> None:
+    super().__init__(timeout=120.0)
+    self._decks = decks
+    self._tag_select.options = [
+      discord.SelectOption(label=t, value=t) for t in _TAGS
+    ]
+
+  @discord.ui.select(
+    placeholder="Choose a tag…",
+    min_values=1,
+    max_values=1,
+    row=0,
+  )
+  async def _tag_select(
+    self,
+    interaction: discord.Interaction,
+    select: discord.ui.Select[Any],
+  ) -> None:
+    # Selection alone requires no response; wait for Apply/Remove.
+    await interaction.response.defer()
+
+  async def _apply_tag(
+    self, interaction: discord.Interaction, apply: bool
+  ) -> None:
+    if not self._tag_select.values:
+      await interaction.response.send_message(
+        "Please choose a tag from the dropdown first.", ephemeral=True
+      )
+      return
+    tag = self._tag_select.values[0]
+    added = removed = already = missing = 0
+    async with get_session() as session:
+      for deck in self._decks:
+        if apply:
+          ok = await add_tag(session, deck.id, tag, interaction.user.id)
+          if ok:
+            added += 1
+          else:
+            already += 1
+        else:
+          ok = await remove_tag(session, deck.id, tag)
+          if ok:
+            removed += 1
+          else:
+            missing += 1
+      await session.commit()
+
+    self.btn_apply.disabled = True
+    self.btn_remove.disabled = True
+    self.stop()
+
+    if apply:
+      parts = []
+      if added:
+        parts.append(f"Added `{tag}` to **{added}** deck(s).")
+      if already:
+        parts.append(f"**{already}** deck(s) already had that tag.")
+      msg = " ".join(parts) or "No changes made."
+    else:
+      parts = []
+      if removed:
+        parts.append(f"Removed `{tag}` from **{removed}** deck(s).")
+      if missing:
+        parts.append(f"**{missing}** deck(s) didn't have that tag.")
+      msg = " ".join(parts) or "No changes made."
+
+    await interaction.response.edit_message(content=msg, view=self)
+
+  @discord.ui.button(
+    label="✅ Apply", style=discord.ButtonStyle.primary, row=1
+  )
+  async def btn_apply(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._apply_tag(interaction, apply=True)
+
+  @discord.ui.button(label="🗑️ Remove", style=discord.ButtonStyle.danger, row=1)
+  async def btn_remove(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button[Any],
+  ) -> None:
+    await self._apply_tag(interaction, apply=False)
 
 
 # ── Bulk-run confirmation view ────────────────────────────────────────────────
@@ -2137,6 +2271,13 @@ async def setup(bot: commands.Bot) -> None:
     app_commands.ContextMenu(
       name="Deck info",
       callback=cog._ctx_deck_info,
+      guild_ids=[get_settings().discord_guild_id],
+    )
+  )
+  bot.tree.add_command(  # type: ignore[arg-type]
+    app_commands.ContextMenu(
+      name="Tag deck(s)",
+      callback=cog._ctx_tag_decks,
       guild_ids=[get_settings().discord_guild_id],
     )
   )

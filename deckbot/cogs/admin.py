@@ -579,6 +579,98 @@ class AdminCog(commands.Cog, name="Admin"):
       f"Node `{name}` deactivated.{reset_msg}", ephemeral=ephemeral
     )
 
+  @deckbot.command(
+    name="node-disable",
+    description="Disable a compute node (active jobs are re-queued)",
+  )
+  @app_commands.describe(name="Name of the node to disable")
+  @app_commands.check(_admin_check)
+  async def node_disable(
+    self,
+    interaction: discord.Interaction,
+    name: str,
+  ) -> None:
+    from sqlalchemy import select
+
+    from deckbot.db.models import Run
+
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      node = await get_node_by_name(session, name)
+      if node is None:
+        await interaction.response.send_message(
+          f"No node named `{name}`.", ephemeral=True
+        )
+        return
+
+      if not node.is_active:
+        await interaction.response.send_message(
+          f"Node `{name}` is already disabled.", ephemeral=ephemeral
+        )
+        return
+
+      node.is_active = False
+
+      # Re-queue any active jobs assigned to this node.
+      result = await session.execute(
+        select(Run).where(
+          Run.node_id == node.id,
+          Run.status.in_(("building", "running")),
+        )
+      )
+      reset_runs = result.scalars().all()
+      for run in reset_runs:
+        run.status = "pending"
+        run.node_id = None
+        run.started_at = None
+        run.run_started_at = None
+
+      await session.commit()
+
+    reset_msg = (
+      f" {len(reset_runs)} active job(s) re-queued." if reset_runs else ""
+    )
+    await interaction.response.send_message(
+      f"Node `{name}` disabled.{reset_msg}", ephemeral=ephemeral
+    )
+
+  @deckbot.command(
+    name="node-enable",
+    description="Re-enable a previously disabled compute node",
+  )
+  @app_commands.describe(name="Name of the node to enable")
+  @app_commands.check(_admin_check)
+  async def node_enable(
+    self,
+    interaction: discord.Interaction,
+    name: str,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+
+      node = await get_node_by_name(session, name)
+      if node is None:
+        await interaction.response.send_message(
+          f"No node named `{name}`.", ephemeral=True
+        )
+        return
+
+      if node.is_active:
+        await interaction.response.send_message(
+          f"Node `{name}` is already enabled.", ephemeral=ephemeral
+        )
+        return
+
+      node.is_active = True
+      await session.commit()
+
+    await interaction.response.send_message(
+      f"Node `{name}` enabled.", ephemeral=ephemeral
+    )
+
 
 async def setup(bot: commands.Bot) -> None:
   await bot.add_cog(AdminCog(bot))  # type: ignore[arg-type]
