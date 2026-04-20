@@ -1187,6 +1187,43 @@ class DecksCog(commands.Cog, name="Decks"):
       embed=embed, view=view, ephemeral=ephemeral
     )
 
+  # ── /deck batch ───────────────────────────────────────────────────────────
+
+  @deck.command(
+    name="batch",
+    description="Show the summary for a specific run batch",
+  )
+  @app_commands.describe(batch_id="Batch ID")
+  async def batch_cmd(
+    self,
+    interaction: discord.Interaction,
+    batch_id: int,
+  ) -> None:
+    async with get_session() as session:
+      deckbot_ch_id = await get_deckbot_channel_id(session)
+      ephemeral = _is_ephemeral(interaction, deckbot_ch_id)
+      batch = await get_batch(session, batch_id)
+      if batch is None:
+        await interaction.response.send_message(
+          f"No batch with ID `{batch_id}`.", ephemeral=True
+        )
+        return
+      summary = await get_batch_summary(session, batch_id)
+
+    api_public_url = get_settings().api_public_url
+    total_run_pages = max(1, math.ceil(summary.total / RUNS_PER_BATCH_PAGE))
+    embed = _build_batch_summary_embed(batch, summary)
+    view = BatchView(
+      batch_id,
+      api_public_url,
+      ephemeral,
+      page=0,
+      total_run_pages=total_run_pages,
+    )
+    await interaction.response.send_message(
+      embed=embed, view=view, ephemeral=ephemeral
+    )
+
   # ── Context menu: "Run this deck" ─────────────────────────────────────────
 
   async def _ctx_run_deck(
